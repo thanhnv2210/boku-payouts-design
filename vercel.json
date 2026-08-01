@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/((?!docs/|fonts/).*)", "destination": "/index.html" }
+  ]
+}

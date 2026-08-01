@@ -1,0 +1,10 @@
+{
+  "tree": [
+    {
+      "id": "payouts-api-design",
+      "title": "Payouts API — Design Decision Record",
+      "type": "markdown",
+      "path": "docs/payouts-api-design.md"
+    }
+  ]
+}
