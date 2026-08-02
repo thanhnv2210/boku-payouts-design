@@ -49,6 +49,12 @@ export default function App() {
         </div>
         {error && <p className="error">{error}</p>}
         <FileExplorer tree={tree} selected={selectedDoc} onSelect={handleSelect} />
+        <div className="rail-tools">
+          <span className="rail-tools-label">Tools</span>
+          <a className="rail-tools-link" href="/api-docs/" target="_blank" rel="noopener noreferrer">
+            API Playground ↗
+          </a>
+        </div>
         <div className="rail-footer">
           <button className="theme-toggle-btn" onClick={toggleTheme} title="Toggle theme">
             {theme === 'dark' ? '☀ Light' : '☽ Dark'}
