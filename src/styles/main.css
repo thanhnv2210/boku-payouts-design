@@ -240,7 +240,7 @@ button { font-family: inherit; cursor: pointer; }
   margin: 0 0 1.1rem;
 }
 .markdown-body pre code { background: none; padding: 0; font-size: 0.85rem; line-height: 1.55; }
-.markdown-body table { border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 0 0 1.5rem; }
+.markdown-body table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 0.9rem; }
 .markdown-body th, .markdown-body td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 .markdown-body thead th {
   font-family: var(--font-mono);
@@ -254,8 +254,9 @@ button { font-family: inherit; cursor: pointer; }
 .markdown-body strong { font-weight: 600; }
 .markdown-body a { text-decoration: underline; text-underline-offset: 2px; }
 
-/* wide content (tables) shouldn't blow out the page */
-.markdown-body table { display: block; overflow-x: auto; }
+/* wide content (tables) scrolls in its own container — the page body never scrolls sideways */
+.table-scroll { overflow-x: auto; margin: 0 0 1.5rem; }
+.table-scroll table { margin: 0; }
 
 /* ---------- Mobile ---------- */
 @media (max-width: 880px) {

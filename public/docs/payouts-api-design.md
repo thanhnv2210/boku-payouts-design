@@ -27,6 +27,15 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 *Assumption:* The caller specifies **what** and **to whom** (amount, currency, beneficiary), not **how** (which rail/partner) — rail selection and failover is the platform's job, mirroring how DASH's FX orchestration picked and failed over between Thunes/Tranglo/WU without the caller knowing.
 *Alternative considered:* Let the caller pick a specific rail/partner — rejected as a default because it leaks internal partner topology into a public contract, though I'd keep an optional `preferred_rail` hint for edge cases.
 
+### Open question for the walkthrough (not an assumption — a thing to confirm live)
+
+Assumption 3 says the platform picks the rail, but it doesn't say **how** rail selection actually works, and I don't want to guess that live. Two materially different models:
+
+- **Single primary rail per corridor, with a priority-ordered fallback list** — a circuit breaker trips on the primary and switches wholesale to the next rail in the list until it recovers.
+- **Genuinely multi-rail** — more than one candidate rail evaluated per payout (cost, speed, success rate), not just a fallback chain.
+
+This isn't cosmetic — it changes the failure-handling design directly: a priority-list-with-circuit-breaker model needs the ambiguous-failure handling in §3.9 (don't fail over to rail 2 while rail 1's outcome is still unknown); a true multi-rail model needs a selection/scoring step I haven't designed here at all. I'd rather surface this as a live question than silently assume one.
+
 ---
 
 ## 2. Solution Terminologies
@@ -43,8 +52,9 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 | **Reconciliation** | Matching Boku's internal payout records against the partner's own settlement/callback records to catch silent discrepancies. |
 | **Ledger entry** | An immutable, append-only record of a funds-movement event, used as the source of truth (vs. mutable payout status, which is a projection). |
 | **Quote** | An ephemeral, short-TTL FX rate lock + preview, obtained *before* a payout is created — not part of the payout ledger. |
+| **Partner reference** | The client-generated reference sent to a disbursement partner on every outbound call — reused from the Idempotency-Key — so an ambiguous outcome can be resolved by querying the partner's own system, not just by retrying. |
+| **Correlation ID** | An ID threaded through every log line, event, and span for one specific execution attempt — distinct from the Idempotency-Key, which spans every retry of one logical request. |
 | **Webhook / callback** | An async, platform-initiated push notification to the caller when a payout's status changes. |
-| **Correlation ID** | An ID threaded through every service/log/event tied to one payout, for tracing across the distributed system. |
 
 ---
 
@@ -119,13 +129,17 @@ Every error response uses a consistent shape (`error_code`, `message`, `request_
 ### 3.3 Payout state machine
 
 ```
-PENDING → SUBMITTED → SETTLED           (happy path)
-                    → FAILED             (rail rejects — terminal)
-                    → RETURNED           (rail accepts, later reverses — terminal)
-PENDING → CANCELLED                      (caller cancels before submission — terminal)
+PENDING → SUBMITTED → SETTLED               (happy path)
+                    → FAILED                 (rail rejects — terminal)
+                    → RETURNED               (rail accepts, later reverses — terminal)
+                    → SUBMITTED_UNCONFIRMED  (partner call outcome unknown — see §3.9)
+SUBMITTED_UNCONFIRMED → SETTLED | FAILED      (resolved via partner-reference lookup, never guessed)
+PENDING → CANCELLED                          (caller cancels before submission — terminal)
 ```
 
 Every transition is a single-writer update guarded by the current state (`UPDATE ... WHERE status = 'PENDING'`), so two concurrent workers can never both advance the same payout — this is the same class of guard I used for the Dash transaction state machine.
+
+`SUBMITTED_UNCONFIRMED` is deliberately non-terminal and deliberately not `FAILED` — a connection drop mid-call to the partner tells you nothing about whether they actually processed it. Guessing either way is wrong: retrying blind risks a duplicate disbursement, marking it `FAILED` risks paying out twice if the partner actually succeeded. It can only be resolved by looking, not by waiting or assuming — see §3.9.
 
 ### 3.4 Failure handling
 
@@ -174,6 +188,25 @@ A payout ledger is a financial system of record — every row should correspond 
 - **Correlation ID** generated at `POST /payouts` and threaded through every log line, Kafka event, and partner call for that payout.
 - Structured logs + metrics (payout latency, failure rate by rail, DLQ depth) as first-class outputs, not an afterthought.
 
+### 3.9 Idempotency — identifiers, storage, and why it's a systemic pattern, not one header
+
+**Idempotency-Key and Correlation-ID answer different questions — don't collapse them.**
+The Idempotency-Key answers *"is this a duplicate request?"* — caller-supplied, and stable across every retry of one logical payout, including a rail failover. The Correlation-ID answers *"how do I trace this specific execution?"* — generated per attempt, and threaded through logs/Kafka events/spans for that attempt alone. If a payout retries or fails over from one rail to another, one Idempotency-Key should span the whole thing, but each attempt should get its own Correlation-ID — collapsing them into a single ID blurs two different attempts (possibly to two different partners) into one trace, which makes exactly the failure this design cares about harder to debug.
+
+**The Idempotency-Key doubles as the partner reference — that's what makes ambiguous-failure recovery possible.**
+On every outbound call to a disbursement partner, send the Idempotency-Key itself (or a partner-safe derivation of it, if their reference field has length/charset limits) as the `client_reference`. This is the exact mechanism DASH used with WU's MTCN reference. It matters specifically when a connection drops mid-call and the outcome is unknown: instead of guessing, query the partner's own status-lookup endpoint using that same reference — this is a targeted, on-demand use of the reconciliation logic in §3.6, triggered by an ambiguous failure instead of the scheduled sweep. This is exactly what the `SUBMITTED_UNCONFIRMED` state in §3.3 exists for, and — critically — **failover to a different rail must wait for that resolution.** Sending the same payout to Partner B while Partner A's outcome is still unknown is exactly how a system pays out twice.
+
+**Where the key lives: Postgres is the source of truth; Redis is a fast-path cache, never the reverse.**
+The Idempotency-Key needs a **unique constraint in the same transactional store as the payout ledger** (Postgres) — dedup-check and payout-creation have to happen in one ACID transaction, or two concurrent requests can both race past a separate check before either writes the payout. Redis alone isn't safe as the source of truth here: it's not durable by default, and an evicted or lost key would let a genuine retry sail through as a "new" payout — unacceptable for money movement. The right split (already reflected in §4's AWS mapping) is: Redis in front, for a sub-millisecond "have I seen this key" check under high submission volume; Postgres behind it as the actual guarantee. If Redis misses or is empty, the request falls through to Postgres, whose unique constraint catches it — and on a constraint violation, look up and return the existing record rather than erroring the caller.
+
+**Idempotency is a property of the whole microservices architecture, not a header on one endpoint.**
+The stack here is event-driven (Kafka) with multiple services (submission, state-machine worker, reconciliation, partner integration) — and duplicate delivery can happen at every hop, not just the public API:
+- **Ingress** (caller → API): the `Idempotency-Key` header, as above.
+- **Internal** (service → service, via Kafka): at-least-once delivery means the state-machine worker *will* see the same event twice eventually. This is already handled, just not previously named as idempotency — the single-writer guard (`UPDATE ... WHERE status = 'PENDING'`) from §3.3 is what makes a duplicate event a no-op instead of a double transition.
+- **Egress** (service → partner): the partner reference, above.
+
+Three layers, three mechanisms, one principle — worth stating explicitly in the walkthrough rather than letting it look like idempotency is just something `POST /payouts` does.
+
 ---
 
 ## 4. Apply for AWS Cloud (example)
@@ -185,7 +218,7 @@ A payout ledger is a financial system of record — every row should correspond 
 | Event backbone | **MSK (managed Kafka)** | Payout-created / status-changed events fan out to reconciliation, webhook dispatch, analytics without tight coupling. |
 | System of record | **RDS PostgreSQL** | ACID guarantees for money movement; idempotency-key table and payout ledger need real transactions, not eventual consistency. |
 | Retry / DLQ | **SQS + DLQ** | Per-rail retry queues with backoff; exhausted messages land in a dead-letter queue for follow-up, exactly like DASH's callback DLQ. |
-| Idempotency fast-path | **ElastiCache (Redis)** | Sub-millisecond duplicate-key check before hitting Postgres, under high submission volume. |
+| Idempotency fast-path | **ElastiCache (Redis)** | Sub-millisecond duplicate-key check before hitting Postgres, under high submission volume — a cache in front of the source of truth, not a replacement for it (see §3.9). |
 | Scheduled reconciliation | **Lambda + EventBridge Scheduler** | Periodic batch job matching partner reports to internal records — same shape as DASH's Lambda-based reconciliation. |
 | Partner credentials / certs | **Secrets Manager** | mTLS certs and partner API keys rotated without redeploying services. |
 | Observability | **CloudWatch + X-Ray** | Structured logs, per-rail failure metrics, distributed traces keyed on the correlation ID. |
@@ -210,8 +243,28 @@ This assumes a blank-slate AWS environment, consistent with Boku's greenfield Ba
 
 ---
 
+## 6. Stakeholder Coverage
+
+A design that only satisfies the API contract misses half of what's actually being evaluated for a Senior/Architect role — the honest version of this section names what's covered, and what isn't, rather than claiming full coverage that hasn't actually been designed.
+
+| Role | What they need from this design | Covered already | Gap |
+|---|---|---|---|
+| **Customer** (the merchant/platform calling the API) | Predictable behavior, no duplicate charges, clear status visibility, fast failure diagnosis | Idempotency-Key (§3.4/§3.9), dual pull+push status tracking (§3.5), structured `error_code`/`failure_reason` | No stated SLA (max time in `PENDING`/`SUBMITTED_UNCONFIRMED` before it's treated as stuck), no rate-limit contract, no API versioning policy for breaking changes |
+| **PO** | Clear scope boundaries, MVP vs. later, ability to justify choices to the business | Quote and batch are explicitly "additive, not foundational" (§1); the approval gate is a policy flag, not a hard requirement (Decision D4) — phased-rollout thinking, not a single monolithic scope | No explicit Phase 1 / Phase 2 scope line, no success metrics tied to product outcomes (payout success rate, time-to-settle), no cost-per-rail tradeoff to inform prioritization |
+| **Developer** | Reasoned state model, testable contracts, low ambiguity at edges | Explicit state machine (§3.3), correlation-id vs. idempotency-key split (§3.9), consistent error shape | No test strategy named (contract tests, chaos-testing rail failures), no API versioning scheme, no client SDK story for the two protocols in play (REST external, gRPC internal) |
+| **DevOps** | Deployability, observability, scaling, secrets handling | Full AWS mapping (§4): EKS, MSK, RDS, SQS+DLQ, Secrets Manager, CloudWatch+X-Ray | No deployment strategy (canary/blue-green), no autoscaling policy for EKS under submission bursts, IaC named (Terraform) but not detailed |
+| **Operation Team** | Investigate a specific stuck payout, manual intervention, alerting thresholds | `SUBMITTED_UNCONFIRMED` exists exactly for stuck cases (§3.3), DLQ for exhausted retries, reconciliation loop (§3.6) | No ops-facing surface at all — no admin API/dashboard, no manual override/force-resolve endpoint, no defined alert threshold (e.g. page if `SUBMITTED_UNCONFIRMED` > 15 min), no runbook |
+| **Financial team** | Immutable audit trail, reconciliation accuracy, dispute resolution, regulatory reporting | Ledger entries are immutable/append-only (§2), reconciliation matches internal ledger vs. partner records (§3.6) | No GL/accounting-system integration point named, no stated audit-log retention policy, no explicit handling of how a `RETURNED` payout reconciles back into finance's books |
+| **Stakeholder** (exec/business) | Risk, cost, time-to-market, scalability story | Greenfield rationale, AWS choices justified against DASH-proven patterns at real scale | No TCO/cost estimate, no phased timeline, no risk register for the Payouts API itself |
+
+**The honest read:** the design is strongest on Customer / Developer / DevOps, because those map directly onto what's already proven at DASH. **Operation Team and Financial team are the thinnest** — the underlying data already supports both (the ledger, `SUBMITTED_UNCONFIRMED`, reconciliation), but there's no explicit ops-facing tooling or finance-integration story naming how those roles actually use it day to day. Naming that gap live is a stronger answer than claiming coverage that isn't there.
+
+---
+
 ## Notes for the live walkthrough
 
 - Lead with Assumption 2 (single vs. batch) early — it's the one most likely to get pushback/questions, and I want to show I've already weighed the alternative rather than have it "discovered" mid-walkthrough.
-- If asked to go deeper on any one area, reconciliation and the state machine are the strongest — direct extensions of the Dash Remittance work.
+- Ask the rail-model open question (end of §1) early too, ideally before diving into failure handling — the answer changes how much of §3.9's ambiguous-failure/failover guard is actually needed versus how much scoring/selection logic I'd need to add.
+- If asked to go deeper on any one area, reconciliation, the state machine, and the idempotency/correlation-id split (§3.9) are the strongest — direct extensions of the Dash Remittance work.
 - Be ready to admit: this design does not attempt to cover **treasury/cash-position** concerns (marked desirable in the JD, not required) — scope it out explicitly if asked, rather than improvising.
+- If asked "who else does this touch beyond the API caller?" — go straight to §6. Naming the Operation Team / Financial team gaps unprompted lands better than waiting to be caught out on them.
