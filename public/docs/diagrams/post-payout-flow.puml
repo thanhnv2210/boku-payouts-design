@@ -1,0 +1,72 @@
+@startuml POST /payouts — Submission Flow
+
+skinparam backgroundColor #f5f6f1
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #c7cbb4
+skinparam sequenceParticipantBackgroundColor #ffffff
+skinparam sequenceLifeLineBorderColor #dbdec9
+skinparam sequenceMessageAlign center
+skinparam noteBorderColor #c7cbb4
+skinparam noteBackgroundColor #f3e8d2
+
+title POST /payouts — Submission & Async Settlement Flow
+
+actor       "Merchant / Caller"   as Caller
+participant "API Gateway"         as GW
+participant "Payout Service"      as PS
+database    "Postgres\n(Ledger)"  as DB
+queue       "Kafka"               as Kafka
+participant "State Machine\nWorker" as SMW
+participant "Partner Rail\n(Bank / Wallet)" as Rail
+
+== 1. Synchronous acceptance (caller waits) ==
+
+Caller -> GW   : POST /payouts\nIdempotency-Key: <uuid>
+GW     -> PS   : forward + validate
+
+PS     -> DB   : BEGIN\nSELECT idempotency_key FOR UPDATE\nINSERT payout (status=PENDING)\nCOMMIT
+note right of DB : Dedup check + payout creation\nin ONE transaction — no race
+
+DB     --> PS  : payout_id = pyo_xxx
+
+PS     -> Kafka : publish payout.created\n{payout_id, correlation_id}
+PS     --> GW  : 202 Accepted
+GW     --> Caller : { payout_id, status: PENDING }
+
+note over Caller : Caller persists payout_id\nand polls / awaits webhook
+
+== 2. Async settlement (caller not involved) ==
+
+Kafka  -> SMW  : consume payout.created
+SMW    -> DB   : UPDATE status=SUBMITTED\nWHERE status=PENDING   /'single-writer guard'/
+
+SMW    -> Rail : submit payout\nclient_reference = Idempotency-Key
+note right of Rail : Reference reused as partner ref —\nenables ambiguous-failure recovery\n(see SUBMITTED_UNCONFIRMED)
+
+alt Happy path
+  Rail --> SMW : 200 OK — accepted
+  SMW  -> DB   : UPDATE status=SETTLED
+  SMW  -> Kafka : publish payout.settled
+
+else Rail rejects (non-retryable)
+  Rail --> SMW : 4xx — invalid account / sanctions
+  SMW  -> DB   : UPDATE status=FAILED\nfailure_reason=BENEFICIARY_ACCOUNT_INVALID
+  SMW  -> Kafka : publish payout.failed
+
+else Connection dropped (outcome unknown)
+  Rail --> SMW : timeout / network error
+  SMW  -> DB   : UPDATE status=SUBMITTED_UNCONFIRMED
+  note right of SMW #f3e8d2 : Do NOT fail over to another rail yet.\nQuery partner using client_reference\nto resolve outcome first.
+  SMW  -> Rail : GET /status?ref=<Idempotency-Key>
+  Rail --> SMW : resolved outcome
+  SMW  -> DB   : UPDATE status=SETTLED | FAILED
+end
+
+Kafka -> "Webhook\nDispatcher" as WD : consume payout.settled / failed
+WD -> Caller : POST <caller_webhook_url>\nHMAC-signed event
+
+note over Caller : Webhook is a convenience layer —\nGET /payouts/{id} is always\nthe source of truth
+
+@enduml

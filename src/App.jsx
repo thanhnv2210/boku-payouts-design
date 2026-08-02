@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import FileExplorer from './components/FileExplorer'
 import MarkdownViewer from './components/MarkdownViewer'
+import PlantUMLViewer from './components/PlantUMLViewer'
 import { useTheme } from './components/ThemeProvider'
 import { loadIndex, findDocById } from './services/fileService'
 
@@ -64,7 +65,8 @@ export default function App() {
       <main className="viewer">
         <button className="menu-btn" onClick={() => setNavOpen(o => !o)} aria-label="Toggle navigation">☰</button>
         {!selectedDoc && <p className="placeholder">Select a document to view</p>}
-        {selectedDoc && <MarkdownViewer doc={selectedDoc} />}
+        {selectedDoc?.type === 'markdown' && <MarkdownViewer doc={selectedDoc} />}
+        {selectedDoc?.type === 'plantuml' && <PlantUMLViewer doc={selectedDoc} />}
       </main>
     </div>
   )

@@ -5,6 +5,17 @@
       "title": "Payouts API — Design Decision Record",
       "type": "markdown",
       "path": "docs/payouts-api-design.md"
+    },
+    {
+      "label": "Diagrams",
+      "children": [
+        {
+          "id": "post-payout-flow",
+          "title": "POST /payouts — Submission Flow",
+          "type": "plantuml",
+          "path": "docs/diagrams/post-payout-flow.puml"
+        }
+      ]
     }
   ]
 }

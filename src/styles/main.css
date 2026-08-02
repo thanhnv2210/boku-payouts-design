@@ -285,6 +285,10 @@ button { font-family: inherit; cursor: pointer; }
 .table-scroll { overflow-x: auto; margin: 0 0 1.5rem; }
 .table-scroll table { margin: 0; }
 
+/* ---------- PlantUML ---------- */
+.plantuml-wrap { overflow-x: auto; }
+.plantuml-img { max-width: 100%; height: auto; display: block; }
+
 /* ---------- Mobile ---------- */
 @media (max-width: 880px) {
   .app { grid-template-columns: 1fr; }

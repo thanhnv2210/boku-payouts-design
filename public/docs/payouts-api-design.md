@@ -22,19 +22,35 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 *Assumption:* I'm designing the core resource as **one payout = one API call**, with a separate `POST /payouts/batch` as an additive wrapper that fans out into individual payout records — because it's cleaner to get single-resource idempotency and state tracking right first, then compose it, rather than starting from batch semantics and bolting on single-payout as a special case.
 *Alternative considered:* Batch-first design (file upload, job ID) — plausible if Boku's actual merchant customers are payroll-style, worth confirming with the interviewer live.
 
-**Assumption 3 — Multiple disbursement rails per payout, selected by the platform, not the caller.**
+**Assumption 3 — Rail selection is the platform's responsibility, not the caller's.**
 *Scenario:* Boku is global (65 countries per the JD) — a payout to Singapore vs. Kenya vs. the US likely rides completely different rails (local bank transfer, mobile money, card push).
-*Assumption:* The caller specifies **what** and **to whom** (amount, currency, beneficiary), not **how** (which rail/partner) — rail selection and failover is the platform's job, mirroring how DASH's FX orchestration picked and failed over between Thunes/Tranglo/WU without the caller knowing.
-*Alternative considered:* Let the caller pick a specific rail/partner — rejected as a default because it leaks internal partner topology into a public contract, though I'd keep an optional `preferred_rail` hint for edge cases.
+*Assumption:* The caller specifies **what** and **to whom** (amount, currency, beneficiary), not **how** (which rail/partner). Rail selection is the platform's job, mirroring how DASH's FX orchestration picked and failed over between Thunes/Tranglo/WU without the caller knowing.
+
+**Why not caller-selects-rail?** This is a real, legitimate model — Stripe, Wise, and some B2B treasury platforms expose it explicitly. It makes sense when the platform's value proposition is "connectivity layer, you control the routing." I'm ruling it out as the *default* here because Boku's value proposition reads differently: 65-country coverage, global corridor management, partner relationships the merchant doesn't have — the platform's job is to abstract that complexity away, not expose it. Letting a caller specify `"rail": "LOCAL_BANK_SG"` throws that abstraction away, and now every merchant needs to know Boku's partner topology per corridor, which couples the public API contract to internal infra decisions. That said, I'd keep an optional `preferred_rail` hint for edge cases where a specific caller genuinely needs it.
+
+*Alternative considered:* Caller-selects-rail — valid if Boku's product is a connectivity/aggregation layer rather than a managed payout service. **Worth confirming live** — see open question below.
 
 ### Open question for the walkthrough (not an assumption — a thing to confirm live)
 
-Assumption 3 says the platform picks the rail, but it doesn't say **how** rail selection actually works, and I don't want to guess that live. Two materially different models:
+**Question 1 — Is the platform a managed payout service or a connectivity layer?**
 
-- **Single primary rail per corridor, with a priority-ordered fallback list** — a circuit breaker trips on the primary and switches wholesale to the next rail in the list until it recovers.
-- **Genuinely multi-rail** — more than one candidate rail evaluated per payout (cost, speed, success rate), not just a fallback chain.
+This determines whether Assumption 3 holds at all:
 
-This isn't cosmetic — it changes the failure-handling design directly: a priority-list-with-circuit-breaker model needs the ambiguous-failure handling in §3.9 (don't fail over to rail 2 while rail 1's outcome is still unknown); a true multi-rail model needs a selection/scoring step I haven't designed here at all. I'd rather surface this as a live question than silently assume one.
+| Model | Who picks the rail | Design impact |
+|---|---|---|
+| **Managed payout service** (my assumption) | Platform, invisibly | Rail selection + failover is internal; caller API stays simple |
+| **Connectivity layer** | Caller specifies upfront | Rail selection layer removed entirely; simpler design, different product |
+
+If it's the connectivity model, I'd remove the rail-selection layer, keep `SUBMITTED_UNCONFIRMED` (a connection drop is still a connection drop regardless of who picked the rail), but drop the failover-blocking logic in §3.9 entirely — there is no rail 2 to fail over to.
+
+**Question 2 — If platform-picks-rail: single primary with fallback, or genuinely multi-rail?**
+
+Assuming Assumption 3 holds, there are still two materially different sub-models:
+
+- **Priority-ordered fallback** — a circuit breaker trips on the primary and switches wholesale to the next rail in the list. Most common in practice.
+- **Genuinely multi-rail** — multiple candidate rails scored per payout (cost, speed, success rate), not just a fallback chain.
+
+This changes the failure-handling design directly: the priority-list model needs the ambiguous-failure guard in §3.9 (don't fail over to rail 2 while rail 1's outcome is still unknown); a true multi-rail model needs a selection/scoring step I haven't designed here. I'd rather surface this as a live question than silently assume one.
 
 ---
 
@@ -264,7 +280,11 @@ A design that only satisfies the API contract misses half of what's actually bei
 ## Notes for the live walkthrough
 
 - Lead with Assumption 2 (single vs. batch) early — it's the one most likely to get pushback/questions, and I want to show I've already weighed the alternative rather than have it "discovered" mid-walkthrough.
-- Ask the rail-model open question (end of §1) early too, ideally before diving into failure handling — the answer changes how much of §3.9's ambiguous-failure/failover guard is actually needed versus how much scoring/selection logic I'd need to add.
+- Ask both rail-model open questions (§1) **before** diving into failure handling — the answers directly scope how much of §3.9 applies:
+  - If caller-selects-rail: the rail-selection layer disappears entirely, failover-blocking in §3.9 goes away, `SUBMITTED_UNCONFIRMED` stays.
+  - If platform-picks-rail with priority-ordered fallback: §3.9 applies in full.
+  - If platform-picks-rail with true multi-rail scoring: need to add a selection/scoring step not currently designed.
+  - Framing it this way shows the design is load-bearing on a real unknown, not a gap — it's a live conversation, not a mistake to defend.
 - If asked to go deeper on any one area, reconciliation, the state machine, and the idempotency/correlation-id split (§3.9) are the strongest — direct extensions of the Dash Remittance work.
 - Be ready to admit: this design does not attempt to cover **treasury/cash-position** concerns (marked desirable in the JD, not required) — scope it out explicitly if asked, rather than improvising.
 - If asked "who else does this touch beyond the API caller?" — go straight to §6. Naming the Operation Team / Financial team gaps unprompted lands better than waiting to be caught out on them.
