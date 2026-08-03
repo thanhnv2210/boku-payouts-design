@@ -8,14 +8,25 @@
     <style>
       body { margin: 0; }
       #swagger-ui .topbar { display: none; }
+      #server-banner {
+        background: #1b1f23; color: #8b949e; font: 12px/32px monospace;
+        padding: 0 16px; display: flex; align-items: center; gap: 8px;
+      }
+      #server-banner span { color: #58a6ff; }
     </style>
   </head>
   <body>
+    <div id="server-banner">mock server: <span id="server-url"></span></div>
     <div id="swagger-ui"></div>
     <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
     <script>
+      const DEFAULT_BASE = 'http://localhost:8090'
+      document.getElementById('server-url').textContent = (new URLSearchParams(window.location.search).get('server') || DEFAULT_BASE).replace(/\/$/, '')
+      const params = new URLSearchParams(window.location.search)
+      const base = (params.get('server') || DEFAULT_BASE).replace(/\/$/, '')
+
       SwaggerUIBundle({
-        url: 'http://localhost:8090/v3/api-docs',
+        url: base + '/v3/api-docs',
         dom_id: '#swagger-ui',
         presets: [
           SwaggerUIBundle.presets.apis,
@@ -25,6 +36,14 @@
         deepLinking: true,
         displayRequestDuration: true,
         tryItOutEnabled: true,
+        requestInterceptor: function(req) {
+          if (req.url.startsWith('/')) {
+            req.url = base + req.url
+          } else if (req.url.startsWith(DEFAULT_BASE)) {
+            req.url = req.url.replace(DEFAULT_BASE, base)
+          }
+          return req
+        },
       })
     </script>
   </body>
