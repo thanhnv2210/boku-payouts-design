@@ -10,10 +10,28 @@
       "label": "Diagrams",
       "children": [
         {
+          "id": "state-machine",
+          "title": "Payout State Machine",
+          "type": "plantuml",
+          "path": "docs/diagrams/state-machine.puml"
+        },
+        {
           "id": "post-payout-flow",
           "title": "POST /payouts — Submission Flow",
           "type": "plantuml",
           "path": "docs/diagrams/post-payout-flow.puml"
+        },
+        {
+          "id": "pull-and-pay-compliance",
+          "title": "Pull-and-Pay with Compliance Gate",
+          "type": "plantuml",
+          "path": "docs/diagrams/pull-and-pay-compliance.puml"
+        },
+        {
+          "id": "funding-models",
+          "title": "Funding Models — Prefunded vs. Pull-and-Pay",
+          "type": "plantuml",
+          "path": "docs/diagrams/funding-models.puml"
         }
       ]
     }

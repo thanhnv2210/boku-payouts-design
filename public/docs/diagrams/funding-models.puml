@@ -1,0 +1,81 @@
+@startuml Funding Models Comparison
+
+skinparam backgroundColor #f5f6f1
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #c7cbb4
+skinparam sequenceParticipantBackgroundColor #ffffff
+skinparam sequenceLifeLineBorderColor #dbdec9
+skinparam sequenceMessageAlign center
+skinparam noteBorderColor #c7cbb4
+skinparam noteBackgroundColor #f3e8d2
+skinparam dividerBackgroundColor #e4efe6
+skinparam dividerBorderColor #2f6f5b
+
+title Funding Models — Prefunded Wallet vs. Atomic Pull-and-Pay
+
+== Model A: Prefunded Wallet (assumed default) ==
+
+actor       "Merchant"            as M
+participant "Payout API"          as API
+database    "Wallet Ledger\n(Postgres)" as WL
+database    "Payout Ledger\n(Postgres)" as PL
+queue       "Kafka"               as K
+participant "Disbursement\nWorker" as DW
+participant "Partner Rail"        as Rail
+
+note over M, Rail #e4efe6 : Step 0 — Merchant tops up wallet BEFORE calling POST /payouts.\nThis is a separate flow (POST /wallets/topup), not shown here.
+
+M -> API  : POST /payouts\n{ amount, beneficiary }
+
+API -> WL : BEGIN\nSELECT balance FOR UPDATE
+alt Sufficient balance
+  API -> WL : UPDATE wallet SET balance = balance - amount\nINSERT wallet_ledger (debit entry)
+  API -> PL : INSERT payout (status=PENDING)\nCOMMIT
+  API -> K  : publish payout.created
+  API --> M : 202 Accepted\n{ payout_id, status: PENDING }
+  note right of API : Funds already Boku's to move.\nPayout acceptance is clean —\none failure surface (disbursement only).
+  K -> DW   : consume payout.created
+  DW -> Rail: submit disbursement
+  Rail --> DW: settled / failed
+  DW -> PL  : UPDATE status = SETTLED | FAILED
+else Insufficient balance
+  API --> M : 422 Unprocessable\n{ error_code: INSUFFICIENT_FUNDS }
+  note right of API : Synchronous rejection —\nno payout record created.
+end
+
+== Model B: Atomic Pull-and-Pay (alternative) ==
+
+actor       "Merchant"            as M2
+participant "Payout API"          as API2
+participant "Payment Rail\n(Debit Mandate)" as PayRail
+database    "Payout Ledger"       as PL2
+queue       "Kafka"               as K2
+participant "Disbursement\nWorker" as DW2
+participant "Partner Rail"        as Rail2
+
+note over M2, Rail2 #fff3e0 : No pre-funding step — caller holds a Boku direct debit mandate.\nOne API call triggers both money movements.
+
+M2 -> API2 : POST /payouts\n{ amount, beneficiary }
+API2 -> PL2 : INSERT payout (status=PENDING)
+API2 --> M2 : 202 Accepted\n{ payout_id, status: PENDING }
+
+API2 -> PayRail : debit caller's account\n(async, via mandate)
+
+note right of PayRail #f3e8d2 : Two failure surfaces now:\n1. Pull from caller fails\n2. Disbursement to beneficiary fails\nEach needs its own error state\nand reconciliation path.
+
+alt Pull succeeds
+  PayRail --> API2 : funds received
+  API2 -> K2 : publish payout.funded
+  K2 -> DW2  : consume payout.funded
+  DW2 -> Rail2 : submit disbursement
+  Rail2 --> DW2 : settled / failed
+  DW2 -> PL2 : UPDATE status = SETTLED | FAILED
+else Pull fails
+  PayRail --> API2 : insufficient funds / mandate revoked
+  API2 -> PL2 : UPDATE status = FAILED\nfailure_reason = PULL_FAILED
+  note right of PL2 : Nothing paid to beneficiary.\nBut a payout record exists — \ncaller must be notified the\npull itself failed, not just settlement.
+end
+
+@enduml

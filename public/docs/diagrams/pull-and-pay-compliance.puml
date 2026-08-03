@@ -1,0 +1,163 @@
+@startuml Pull-and-Pay with Compliance Gate
+
+skinparam backgroundColor #f5f6f1
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #c7cbb4
+skinparam sequenceParticipantBackgroundColor #ffffff
+skinparam sequenceLifeLineBorderColor #dbdec9
+skinparam sequenceMessageAlign center
+skinparam noteBorderColor #c7cbb4
+skinparam noteBackgroundColor #f3e8d2
+
+title Pull-and-Pay — Compliance Gate + Explicit Fund Pull + Refund Flow
+
+actor       "Merchant"                 as M
+participant "Payout API"               as API
+database    "Payout Ledger"            as DB
+queue       "Kafka"                    as K
+participant "Compliance\nService"      as CS
+participant "Fraud Engine"             as FE
+participant "AML / Sanctions\nScanner" as AML
+participant "Manual Review\nQueue"     as MRQ
+participant "Fund Pull\nWorker"        as FPW
+participant "Disbursement\nWorker"     as DW
+participant "Payment Rail\n(Debit)"    as PayRail
+participant "Partner Rail"             as Rail
+participant "Refund\nWorker"           as RW
+
+== 1. Acceptance (sync) ==
+
+M -> API : POST /payouts\n{ amount, beneficiary, purpose }
+API -> DB : INSERT payout (status=PENDING)
+API -> K  : publish payout.created
+API --> M : 202 Accepted\n{ payout_id, status: PENDING }
+
+note over M : Caller gets payout_id immediately.\nNo funds touched yet.
+
+== 2. Compliance gate (async — before any funds move) ==
+
+K -> CS  : consume payout.created
+CS -> DB : UPDATE status = PENDING_COMPLIANCE
+
+CS -> FE  : fraud check
+FE --> CS : PASS | FAIL
+
+alt Fraud FAILS
+  CS -> DB : UPDATE status = REJECTED_COMPLIANCE\nrejection_reason = FRAUD_SCORE_EXCEEDED
+  CS -> K  : publish payout.rejected_compliance
+  note right of CS #f1dcd6 : Terminal. No funds moved — no refund.\nCaller notified via webhook.
+  K --> M  : webhook: payout.rejected_compliance
+
+else Fraud passes — run AML
+  CS -> AML : sanctions + PEP scan\n(OFAC, UN, EU, local lists)
+
+  alt Hard hit
+    AML --> CS : SANCTIONS_MATCH
+    CS -> DB   : UPDATE status = REJECTED_COMPLIANCE\nrejection_reason = SANCTIONS_MATCH
+    CS -> K    : publish payout.rejected_compliance
+    note right of CS #f1dcd6 : Terminal. No funds moved.\nMay trigger regulatory reporting.
+    K --> M    : webhook: payout.rejected_compliance
+
+  else Soft hit
+    AML --> CS : PEP_DETECTED | PARTIAL_MATCH
+    CS -> DB   : UPDATE status = PENDING_MANUAL_REVIEW
+    CS -> MRQ  : enqueue { payout_id, hit_reason, beneficiary }
+
+    alt Reviewer approves
+      MRQ -> DB : UPDATE status = PENDING_COMPLIANCE
+      MRQ -> K  : publish payout.compliance_passed
+    else Reviewer rejects
+      MRQ -> DB : UPDATE status = REJECTED_COMPLIANCE
+      MRQ -> K  : publish payout.rejected_compliance
+      K --> M   : webhook: payout.rejected_compliance
+    end
+
+  else All clear
+    AML --> CS : PASS
+    CS -> K    : publish payout.compliance_passed
+  end
+end
+
+== 3. Fund pull (separate step — compliance passed, before disburse) ==
+
+K -> FPW  : consume payout.compliance_passed
+FPW -> DB : UPDATE status = FUND_PULLING
+
+FPW -> PayRail : pull funds from caller\n(direct debit mandate)
+
+alt Pull FAILS
+  PayRail --> FPW : INSUFFICIENT_FUNDS | MANDATE_REVOKED
+  FPW -> DB      : UPDATE status = FUND_PULL_FAILED\nfailure_reason = INSUFFICIENT_FUNDS
+  FPW -> K       : publish payout.fund_pull_failed
+  K --> M        : webhook: payout.fund_pull_failed
+  note right of FPW #f1dcd6 : Terminal. No funds moved — no refund needed.\nCaller's account was never debited.
+
+else Pull SUCCEEDS
+  PayRail --> FPW : funds received — Boku now holds amount
+  FPW -> DB      : UPDATE status = SUBMITTED
+  FPW -> K       : publish payout.funded
+  note right of FPW #e4efe6 : From SUBMITTED onward, funds are\nalways with Boku. No flag needed —\nevery failure from here triggers a refund.
+end
+
+== 4. Disbursement (funds are with Boku — single concern worker) ==
+
+K -> DW  : consume payout.funded
+DW -> Rail : submit disbursement\nclient_reference = Idempotency-Key
+
+alt Disbursement SETTLED
+  Rail --> DW : settled
+  DW -> DB    : UPDATE status = SETTLED
+  DW -> K     : publish payout.settled
+  K --> M     : webhook: payout.settled
+
+else Disbursement FAILED (non-retryable)
+  Rail --> DW : BENEFICIARY_ACCOUNT_INVALID | SANCTIONS_HOLD
+  DW -> DB    : UPDATE status = FAILED\nfailure_reason = BENEFICIARY_ACCOUNT_INVALID
+  DW -> K     : publish payout.failed
+  K --> M     : webhook: payout.failed
+
+else Connection DROPPED (outcome unknown)
+  Rail --> DW : timeout / network error
+  DW -> DB    : UPDATE status = SUBMITTED_UNCONFIRMED
+  note right of DW #f3e8d2 : Do NOT trigger refund yet.\nOutcome still unknown.\nQuery partner first.
+  DW -> Rail  : GET status?ref=<Idempotency-Key>
+
+  alt Resolves: SETTLED
+    Rail --> DW : settled
+    DW -> DB    : UPDATE status = SETTLED
+    DW -> K     : publish payout.settled
+    K --> M     : webhook: payout.settled
+  else Resolves: FAILED
+    Rail --> DW : not found / failed
+    DW -> DB    : UPDATE status = FAILED
+    DW -> K     : publish payout.failed
+    K --> M     : webhook: payout.failed
+  end
+end
+
+== 5. Refund (triggered for every FAILED / RETURNED from SUBMITTED) ==
+
+K -> RW : consume payout.failed | payout.returned
+note right of RW : SUBMITTED was reached = funds always with Boku.\nNo flag check — always refund.
+RW -> DB : UPDATE status = REFUND_PENDING
+
+RW -> PayRail : push refund to caller\n(reverse the original pull)
+
+alt Refund SUCCEEDS
+  PayRail --> RW : settled
+  RW -> DB      : UPDATE status = REFUNDED
+  RW -> K       : publish payout.refunded
+  K --> M       : webhook: payout.refunded
+  note right of RW #e4efe6 : Terminal.\nFull audit trail:\npull → failed → refunded.
+
+else Refund FAILS
+  PayRail --> RW : rejected / error
+  RW -> DB      : UPDATE status = REFUND_FAILED
+  RW -> K       : publish payout.refund_failed
+  K --> M       : webhook: payout.refund_failed
+  note right of RW #f1dcd6 : Serious ops incident.\nMoney with Boku — not with\nbeneficiary or caller.\nPage oncall immediately.
+end
+
+@enduml

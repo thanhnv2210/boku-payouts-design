@@ -30,6 +30,23 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 
 *Alternative considered:* Caller-selects-rail — valid if Boku's product is a connectivity/aggregation layer rather than a managed payout service. **Worth confirming live** — see open question below.
 
+**Assumption 4 — Funding model: prefunded wallet, not atomic pull-and-pay.**
+*Scenario:* Before Boku can disburse to a beneficiary, the money has to come from somewhere. There are two real-world models:
+
+| Model | How it works | Design impact |
+|---|---|---|
+| **Prefunded wallet** (my assumption) | Merchant tops up a Boku-held balance in advance. `POST /payouts` checks and debits the wallet atomically before queuing disbursement. | `POST /payouts` can reject synchronously with `INSUFFICIENT_FUNDS`. Needs a `Wallet` resource and `POST /wallets/topup`. Two-ledger: wallet ledger + payout ledger. |
+| **Atomic pull-and-pay** | `POST /payouts` triggers both a debit on the caller's payment account and the disbursement to the beneficiary in a single coordinated flow. No pre-funding step. | Simpler for the caller — one API call does everything. But now `POST /payouts` has two failure surfaces (pull fails, or disbursement fails), and a failed pull means neither side moves. Requires Boku to hold a direct debit mandate on the caller's account. |
+
+*Assumption:* I'm designing for **prefunded wallet** because it's the dominant model among B2B payout aggregators (Thunes, Airwallex, Rapyd) and it keeps `POST /payouts` semantically clean — by the time a payout is submitted, the funds are already Boku's to move. Atomic pull-and-pay is more elegant for the caller but introduces a two-phase money movement inside a single API call, which complicates failure handling significantly.
+
+*What this adds to the prefunded model:*
+- `POST /wallets/topup` — merchant initiates a fund transfer into their Boku wallet (out of scope for this design iteration, but named)
+- Balance check inside `POST /payouts` — atomic with the idempotency dedup check: deduct from wallet + create payout in one transaction, or reject with `INSUFFICIENT_FUNDS`
+- `INSUFFICIENT_FUNDS` as a new synchronous `422` rejection — the only case where `POST /payouts` fails without creating a payout record
+
+*Alternative considered:* Atomic pull-and-pay — valid, especially for embedded finance or marketplace platforms where the caller's funds are already in a Boku-connected account. See diagram in the sidebar for how the flow differs. **Worth confirming live** — see open question below.
+
 ### Open question for the walkthrough (not an assumption — a thing to confirm live)
 
 **Question 1 — Is the platform a managed payout service or a connectivity layer?**
@@ -71,6 +88,18 @@ This changes the failure-handling design directly: the priority-list model needs
 | **Partner reference** | The client-generated reference sent to a disbursement partner on every outbound call — reused from the Idempotency-Key — so an ambiguous outcome can be resolved by querying the partner's own system, not just by retrying. |
 | **Correlation ID** | An ID threaded through every log line, event, and span for one specific execution attempt — distinct from the Idempotency-Key, which spans every retry of one logical request. |
 | **Webhook / callback** | An async, platform-initiated push notification to the caller when a payout's status changes. |
+| **Wallet / prefunded balance** | A Boku-held balance belonging to the caller, debited atomically when a payout is accepted. The source of funds for disbursement in the prefunded model. |
+| **Atomic pull-and-pay** | An alternative funding model where `POST /payouts` triggers both a debit on the caller's external account and the beneficiary disbursement in one coordinated flow — no separate top-up step. |
+| **Compliance gate** | An async fraud + AML/sanctions check that runs after `202 Accepted` but before any funds move. The payout sits in `PENDING_COMPLIANCE` until the gate passes or blocks. |
+| **`PENDING_COMPLIANCE`** | Non-terminal state: payout accepted, compliance checks in progress, no funds moved yet. |
+| **`REJECTED_COMPLIANCE`** | Terminal state: compliance gate blocked the payout (sanctions match, fraud score exceeded, PEP detected). Distinct from `FAILED` — this is a legal/policy block, not a rail issue. |
+| **`PENDING_MANUAL_REVIEW`** | Non-terminal state: compliance returned a soft hit (partial match, PEP flag) — a human reviewer must approve or reject before the payout can proceed. |
+| **Hard hit / Soft hit** | AML screening outcomes. Hard hit = definitive sanctions match → auto-reject. Soft hit = partial match or PEP detected → route to manual review queue. |
+| **`FUND_PULLING`** | Non-terminal state (Pull-and-Pay only): compliance passed, the platform is now debiting the caller's account before disbursement begins. Separating this from `SUBMITTED` means if `SUBMITTED` is ever reached, funds are always with Boku — no flag needed. |
+| **`FUND_PULL_FAILED`** | Terminal state: the debit on the caller's account failed (insufficient funds, mandate revoked). No funds moved — no refund required. |
+| **`REFUND_PENDING`** | Non-terminal state (Pull-and-Pay only): disbursement failed after funds were pulled; a refund payment back to the caller is in progress. |
+| **`REFUNDED`** | Terminal state: caller's funds have been successfully returned. Full audit trail preserved: pull → failed → refunded. |
+| **`REFUND_FAILED`** | Terminal state: refund attempt to the caller also failed. Money is with Boku — neither beneficiary nor caller holds it. Requires immediate manual ops intervention. |
 
 ---
 
@@ -145,15 +174,58 @@ Every error response uses a consistent shape (`error_code`, `message`, `request_
 ### 3.3 Payout state machine
 
 ```
-PENDING → SUBMITTED → SETTLED               (happy path)
-                    → FAILED                 (rail rejects — terminal)
-                    → RETURNED               (rail accepts, later reverses — terminal)
-                    → SUBMITTED_UNCONFIRMED  (partner call outcome unknown — see §3.9)
-SUBMITTED_UNCONFIRMED → SETTLED | FAILED      (resolved via partner-reference lookup, never guessed)
-PENDING → CANCELLED                          (caller cancels before submission — terminal)
+PENDING → PENDING_COMPLIANCE → FUND_PULLING → SUBMITTED → SETTLED    (happy path, compliance + pull-and-pay)
+PENDING → FUND_PULLING → SUBMITTED → SETTLED                          (happy path, no compliance gate)
+PENDING → SUBMITTED → SETTLED                                         (happy path, prefunded wallet)
+
+PENDING_COMPLIANCE → FUND_PULLING                                     (compliance passes)
+PENDING_COMPLIANCE → REJECTED_COMPLIANCE                              (hard hit — terminal, no funds moved)
+PENDING_COMPLIANCE → PENDING_MANUAL_REVIEW                            (soft hit — human review)
+PENDING_MANUAL_REVIEW → FUND_PULLING | REJECTED_COMPLIANCE            (reviewer decides)
+
+FUND_PULLING → SUBMITTED                                              (pull succeeds — funds with Boku)
+FUND_PULLING → FUND_PULL_FAILED                                       (pull fails — terminal, no refund needed)
+
+SUBMITTED → SETTLED                                                   (rail confirms)
+SUBMITTED → FAILED                                                    (rail rejects — non-retryable)
+SUBMITTED → RETURNED                                                  (rail accepted, later reversed)
+SUBMITTED → SUBMITTED_UNCONFIRMED                                     (connection dropped — outcome unknown)
+SUBMITTED_UNCONFIRMED → SETTLED | FAILED                              (resolved via partner-reference lookup only)
+
+FAILED   → REFUND_PENDING                                             (Pull-and-Pay: SUBMITTED reached = funds always with Boku)
+RETURNED → REFUND_PENDING                                             (Pull-and-Pay: rail reversed after pull)
+REFUND_PENDING → REFUNDED                                             (refund to caller succeeds — terminal)
+REFUND_PENDING → REFUND_FAILED                                        (refund also fails — terminal, manual intervention)
+
+PENDING → CANCELLED                                                   (caller cancels before submission — terminal)
 ```
 
-Every transition is a single-writer update guarded by the current state (`UPDATE ... WHERE status = 'PENDING'`), so two concurrent workers can never both advance the same payout — this is the same class of guard I used for the Dash transaction state machine.
+See the **State Machine diagram** in the sidebar for the full visual.
+
+**Why `FUND_PULLING` as a separate state simplifies the design:**
+Separating fund pull from disbursement means that if `SUBMITTED` was reached, funds are *always* with Boku — no `funds_pulled` flag needed anywhere. Every `FAILED` or `RETURNED` from `SUBMITTED` unconditionally triggers a refund. The disbursement worker does one thing only: send money to the beneficiary.
+
+**Refund trigger — simplified:**
+
+| State | Refund needed? | Why |
+|---|---|---|
+| `REJECTED_COMPLIANCE` | No | Compliance runs before any funds move |
+| `FUND_PULL_FAILED` | No | Pull failed — caller's account never debited |
+| `FAILED` (from `SUBMITTED`) | Yes — always | `SUBMITTED` means funds are with Boku |
+| `RETURNED` (from `SUBMITTED`) | Yes — always | Rail reversed after Boku already held funds |
+| `SUBMITTED_UNCONFIRMED → FAILED` | Yes — after lookup resolves | Wait for partner-reference resolution first |
+
+`REFUND_FAILED` is the most serious ops state — money is with Boku, not with the beneficiary or the caller. Must have a defined alerting threshold (e.g., page oncall within 5 minutes of entering this state).
+
+Every transition is a single-writer update guarded by the current state (`UPDATE ... WHERE status = 'X'`), so two concurrent workers can never both advance the same payout — this is the same class of guard I used for the Dash transaction state machine.
+
+**On `PENDING_COMPLIANCE`:** the compliance gate runs *after* `202 Accepted` but *before* any funds move. This is the correct placement — the caller gets an immediate acknowledgement, and the platform runs fraud/AML checks async without blocking the API on a scan that may take seconds. The gate is optional per corridor or payout type: low-risk, same-currency payouts below a threshold may skip it; high-value or cross-border payouts always go through.
+
+**Two checks, sequenced:**
+- **Fraud screening** — velocity checks, amount anomalies, beneficiary pattern matching. Fast, automated, binary pass/fail.
+- **AML / sanctions scan** — screen beneficiary against OFAC, UN, EU, and local sanctions lists. Mandatory for cross-border. A *hard hit* (exact match) auto-rejects to `REJECTED_COMPLIANCE`; a *soft hit* (partial match, PEP detected) routes to `PENDING_MANUAL_REVIEW` for a human decision.
+
+**`REJECTED_COMPLIANCE` is deliberately separate from `FAILED`.** `FAILED` means a rail issue — a transient or retryable problem in the disbursement layer. `REJECTED_COMPLIANCE` means a legal/policy block — no amount of retrying will change the outcome, and the rejection reason (`SANCTIONS_MATCH`, `FRAUD_SCORE_EXCEEDED`, `PEP_DETECTED`) has different downstream implications (regulatory reporting, account review) that must not be conflated with a bank timeout.
 
 `SUBMITTED_UNCONFIRMED` is deliberately non-terminal and deliberately not `FAILED` — a connection drop mid-call to the partner tells you nothing about whether they actually processed it. Guessing either way is wrong: retrying blind risks a duplicate disbursement, marking it `FAILED` risks paying out twice if the partner actually succeeded. It can only be resolved by looking, not by waiting or assuming — see §3.9.
 
@@ -286,5 +358,8 @@ A design that only satisfies the API contract misses half of what's actually bei
   - If platform-picks-rail with true multi-rail scoring: need to add a selection/scoring step not currently designed.
   - Framing it this way shows the design is load-bearing on a real unknown, not a gap — it's a live conversation, not a mistake to defend.
 - If asked to go deeper on any one area, reconciliation, the state machine, and the idempotency/correlation-id split (§3.9) are the strongest — direct extensions of the Dash Remittance work.
+- Ask the funding model question (Assumption 4) early — it changes `POST /payouts` materially:
+  - Prefunded wallet → `POST /payouts` can reject synchronously with `INSUFFICIENT_FUNDS`; needs a wallet resource
+  - Atomic pull-and-pay → one API call, two failure surfaces; pull failure means nothing moves; simpler for caller, harder to reason about failures
 - Be ready to admit: this design does not attempt to cover **treasury/cash-position** concerns (marked desirable in the JD, not required) — scope it out explicitly if asked, rather than improvising.
 - If asked "who else does this touch beyond the API caller?" — go straight to §6. Naming the Operation Team / Financial team gaps unprompted lands better than waiting to be caught out on them.

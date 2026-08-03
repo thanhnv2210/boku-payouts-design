@@ -1,0 +1,127 @@
+@startuml Payout State Machine
+
+skinparam backgroundColor #f5f6f1
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam stateBorderColor #c7cbb4
+skinparam stateBackgroundColor #ffffff
+skinparam stateArrowColor #565f55
+skinparam noteBorderColor #c7cbb4
+skinparam noteBackgroundColor #f3e8d2
+
+title Payout State Machine
+
+state "PENDING" as PENDING
+state "PENDING_COMPLIANCE" as PC #e4efe6
+state "PENDING_MANUAL_REVIEW" as PMR #fff3e0
+state "FUND_PULLING" as FP #fff3e0
+state "SUBMITTED" as SUBMITTED
+state "SUBMITTED_UNCONFIRMED" as UNCONF #f3e8d2
+state "REFUND_PENDING" as RP #fff3e0
+state "SETTLED" as SETTLED #e4efe6         : Terminal
+state "FUND_PULL_FAILED" as FPF #f1dcd6    : Terminal
+state "FAILED" as FAILED #f1dcd6           : Terminal
+state "RETURNED" as RETURNED #f1dcd6       : Terminal
+state "REFUNDED" as REFUNDED #e4efe6       : Terminal
+state "REFUND_FAILED" as RF #f1dcd6        : Terminal\n(manual intervention)
+state "REJECTED_COMPLIANCE" as RC #f1dcd6  : Terminal
+state "CANCELLED" as CANCELLED #f1dcd6     : Terminal
+
+[*] --> PENDING : POST /payouts\n202 Accepted
+
+PENDING --> PC        : compliance gate\nenabled for corridor
+PENDING --> FP        : compliance gate\nnot required
+PENDING --> CANCELLED : caller cancels\nbefore submission
+
+PC --> FP  : fraud + AML pass (auto)
+PC --> RC  : hard hit\n(SANCTIONS_MATCH,\nFRAUD_SCORE_EXCEEDED)
+PC --> PMR : soft hit\n(PEP_DETECTED,\nPARTIAL_MATCH)
+
+PMR --> FP : reviewer approves
+PMR --> RC : reviewer rejects
+
+note right of PC
+  Runs AFTER 202 Accepted,
+  BEFORE any funds move.
+  Fraud + AML/sanctions
+  run in sequence here.
+end note
+
+FP --> SUBMITTED   : pull succeeds\nfunds with Boku
+FP --> FPF         : pull fails\n(INSUFFICIENT_FUNDS,\nMANDATE_REVOKED)
+
+note right of FP
+  Pull-and-Pay only.
+  Prefunded wallet: skip
+  FUND_PULLING — wallet
+  debited at PENDING.
+end note
+
+note right of FPF
+  No funds moved.
+  No refund needed.
+  Caller's account
+  was never debited.
+end note
+
+SUBMITTED --> SETTLED : rail confirms\nfunds delivered
+SUBMITTED --> FAILED  : rail rejects\n(non-retryable)
+SUBMITTED --> RETURNED : rail accepted,\nlater reversed
+SUBMITTED --> UNCONF  : connection dropped\n(outcome unknown)
+
+UNCONF --> SETTLED : partner lookup\nresolves: settled
+UNCONF --> FAILED  : partner lookup\nresolves: failed
+
+note right of UNCONF
+  NOT the same as FAILED.
+  Must query partner via
+  client_reference first —
+  no failover until resolved,
+  no refund until resolved.
+end note
+
+' Refund path — Pull-and-Pay only
+' Every FAILED/RETURNED from SUBMITTED means funds were pulled (FUND_PULLING passed)
+FAILED   --> RP : Pull-and-Pay:\nfunds already with Boku
+RETURNED --> RP : Pull-and-Pay:\nrail reversed after pull
+UNCONF   --> RP : Pull-and-Pay:\nlookup resolves failed
+
+note right of RP
+  Pull-and-Pay only.
+  If SUBMITTED was reached,
+  funds_pulled is always true —
+  no flag check needed.
+  Prefunded wallet: internal
+  credit, no new state.
+end note
+
+RP --> REFUNDED : refund to caller\nsucceeds
+RP --> RF       : refund to caller\nalso fails
+
+note right of RF
+  Serious ops incident:
+  money with Boku — not with
+  beneficiary or caller.
+  Page oncall immediately.
+  Manual resolution required.
+end note
+
+note right of RC
+  NOT the same as FAILED.
+  Legal/policy block.
+  No funds moved —
+  no refund required.
+  May trigger regulatory
+  reporting obligation.
+end note
+
+SETTLED   --> [*]
+REFUNDED  --> [*]
+FAILED    --> [*]
+FPF       --> [*]
+RF        --> [*]
+RETURNED  --> [*]
+RC        --> [*]
+CANCELLED --> [*]
+
+@enduml
