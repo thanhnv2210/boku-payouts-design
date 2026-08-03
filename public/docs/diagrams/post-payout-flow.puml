@@ -11,62 +11,146 @@ skinparam sequenceMessageAlign center
 skinparam noteBorderColor #c7cbb4
 skinparam noteBackgroundColor #f3e8d2
 
-title POST /payouts — Submission & Async Settlement Flow
+title POST /payouts — Full Flow (Pull-and-Pay with Compliance Gate)
 
-actor       "Merchant / Caller"   as Caller
-participant "API Gateway"         as GW
-participant "Payout Service"      as PS
-database    "Postgres\n(Ledger)"  as DB
-queue       "Kafka"               as Kafka
-participant "State Machine\nWorker" as SMW
-participant "Partner Rail\n(Bank / Wallet)" as Rail
+actor       "Merchant"                  as M
+participant "API Gateway\n(30s timeout)" as GW
+participant "Payout Service"            as PS
+database    "Postgres\n(Ledger + Audit)" as DB
+queue       "Kafka"                     as K
+participant "Compliance\nService"       as CS
+participant "Fund Pull\nWorker"         as FPW
+participant "Payment Rail\n(Debit)"     as PayRail
+participant "Disbursement\nWorker"      as DW
+participant "Partner Rail"              as Rail
+participant "Refund\nWorker"            as RW
+participant "Webhook\nDispatcher"       as WD
 
-== 1. Synchronous acceptance (caller waits) ==
+== 1. Synchronous acceptance — must complete well within 30s gateway timeout ==
 
-Caller -> GW   : POST /payouts\nIdempotency-Key: <uuid>
-GW     -> PS   : forward + validate
+M  -> GW : POST /payouts\nIdempotency-Key: <uuid>
+GW -> PS : forward + validate
 
-PS     -> DB   : BEGIN\nSELECT idempotency_key FOR UPDATE\nINSERT payout (status=PENDING)\nCOMMIT
-note right of DB : Dedup check + payout creation\nin ONE transaction — no race
+PS -> DB : BEGIN\nSELECT idempotency_key FOR UPDATE  /'Redis fast-path first'/\nINSERT payout (status=PENDING)\nINSERT payout_audit (to_status=PENDING)\nCOMMIT
 
-DB     --> PS  : payout_id = pyo_xxx
+note right of DB : Dedup check + payout INSERT\nin ONE ACID transaction.\nNo race between concurrent retries.
 
-PS     -> Kafka : publish payout.created\n{payout_id, correlation_id}
-PS     --> GW  : 202 Accepted
-GW     --> Caller : { payout_id, status: PENDING }
+DB --> PS : payout_id = pyo_xxx
+PS -> K   : publish payout.created /'fire-and-forget — do not await ack'/
+PS --> GW : 202 Accepted
+GW --> M  : { payout_id, status: PENDING }
 
-note over Caller : Caller persists payout_id\nand polls / awaits webhook
+note over M : Caller persists payout_id.\nGateway is done — all steps below\nare async, gateway-immune.
 
-== 2. Async settlement (caller not involved) ==
+== 2. Compliance gate (PENDING → PENDING_COMPLIANCE) ==
 
-Kafka  -> SMW  : consume payout.created
-SMW    -> DB   : UPDATE status=SUBMITTED\nWHERE status=PENDING   /'single-writer guard'/
+K  -> CS : consume payout.created
+CS -> DB : UPDATE status = PENDING_COMPLIANCE\nINSERT payout_audit (from=PENDING, to=PENDING_COMPLIANCE, duration_ms)
 
-SMW    -> Rail : submit payout\nclient_reference = Idempotency-Key
-note right of Rail : Reference reused as partner ref —\nenables ambiguous-failure recovery\n(see SUBMITTED_UNCONFIRMED)
+CS -> CS : fraud check\n(velocity, amount, beneficiary pattern)
 
-alt Happy path
-  Rail --> SMW : 200 OK — accepted
-  SMW  -> DB   : UPDATE status=SETTLED
-  SMW  -> Kafka : publish payout.settled
+alt Fraud FAILS
+  CS -> DB  : UPDATE status = REJECTED_COMPLIANCE\nINSERT payout_audit (to=REJECTED_COMPLIANCE, failure_reason=FRAUD_SCORE_EXCEEDED)
+  CS -> K   : publish payout.rejected_compliance
+  K  --> WD : consume → webhook to merchant
+  note right of CS #f1dcd6 : Terminal. No funds moved.\nNo refund required.
 
-else Rail rejects (non-retryable)
-  Rail --> SMW : 4xx — invalid account / sanctions
-  SMW  -> DB   : UPDATE status=FAILED\nfailure_reason=BENEFICIARY_ACCOUNT_INVALID
-  SMW  -> Kafka : publish payout.failed
+else Fraud passes — AML scan
+  CS -> CS : AML / sanctions scan\n(OFAC, UN, EU, local lists)
 
-else Connection dropped (outcome unknown)
-  Rail --> SMW : timeout / network error
-  SMW  -> DB   : UPDATE status=SUBMITTED_UNCONFIRMED
-  note right of SMW #f3e8d2 : Do NOT fail over to another rail yet.\nQuery partner using client_reference\nto resolve outcome first.
-  SMW  -> Rail : GET /status?ref=<Idempotency-Key>
-  Rail --> SMW : resolved outcome
-  SMW  -> DB   : UPDATE status=SETTLED | FAILED
+  alt Hard hit
+    CS -> DB : UPDATE status = REJECTED_COMPLIANCE\nfailure_reason = SANCTIONS_MATCH
+    CS -> K  : publish payout.rejected_compliance
+    K --> WD : consume → webhook to merchant
+    note right of CS #f1dcd6 : Terminal. May trigger\nregulatory reporting.
+
+  else Soft hit → manual review
+    CS -> DB : UPDATE status = PENDING_MANUAL_REVIEW
+    note right of DB #fff3e0 : Human reviewer approves or rejects.\nFlow resumes on decision.
+
+  else All clear
+    CS -> K  : publish payout.compliance_passed
+  end
 end
 
-Kafka -> "Webhook\nDispatcher" as WD : consume payout.settled / failed
-WD -> Caller : POST <caller_webhook_url>\nHMAC-signed event
+== 3. Fund pull (FUND_PULLING) — separate worker, single concern ==
 
-note over Caller : Webhook is a convenience layer —\nGET /payouts/{id} is always\nthe source of truth
+K   -> FPW : consume payout.compliance_passed
+FPW -> DB  : UPDATE status = FUND_PULLING\nINSERT payout_audit (from=PENDING_COMPLIANCE, to=FUND_PULLING, duration_ms)
+
+FPW -> PayRail : debit caller account\n(direct debit mandate)
+
+alt Pull FAILS
+  PayRail --> FPW : INSUFFICIENT_FUNDS | MANDATE_REVOKED
+  FPW -> DB      : UPDATE status = FUND_PULL_FAILED\nINSERT payout_audit (to=FUND_PULL_FAILED, failure_reason)
+  FPW -> K       : publish payout.fund_pull_failed
+  K --> WD       : consume → webhook to merchant
+  note right of FPW #f1dcd6 : Terminal. No funds moved.\nNo refund required.
+
+else Pull SUCCEEDS
+  PayRail --> FPW : funds received — Boku holds amount
+  FPW -> DB      : UPDATE status = SUBMITTED\nINSERT payout_audit (from=FUND_PULLING, to=SUBMITTED, duration_ms)
+  FPW -> K       : publish payout.funded
+  note right of FPW #e4efe6 : SUBMITTED = funds always with Boku.\nEvery failure from here triggers a refund.\nNo funds_pulled flag needed.
+end
+
+== 4. Disbursement — single concern worker ==
+
+K  -> DW : consume payout.funded
+DW -> Rail : submit disbursement\nclient_reference = Idempotency-Key
+
+note right of Rail : Idempotency-Key reused as partner ref.\nEnables outcome lookup if connection drops.
+
+alt SETTLED
+  Rail --> DW : confirmed
+  DW -> DB    : UPDATE status = SETTLED\nINSERT payout_audit (to=SETTLED, duration_ms)
+  DW -> K     : publish payout.settled
+  K --> WD    : consume → webhook to merchant
+
+else FAILED (non-retryable)
+  Rail --> DW : BENEFICIARY_ACCOUNT_INVALID | SANCTIONS_HOLD
+  DW -> DB    : UPDATE status = FAILED\nINSERT payout_audit (to=FAILED, failure_reason)
+  DW -> K     : publish payout.failed
+  K --> WD    : consume → webhook to merchant
+
+else SUBMITTED_UNCONFIRMED (connection dropped)
+  Rail --> DW : timeout / network error
+  DW -> DB    : UPDATE status = SUBMITTED_UNCONFIRMED\nINSERT payout_audit (to=SUBMITTED_UNCONFIRMED)
+  note right of DW #f3e8d2 : Do NOT refund yet — outcome unknown.\nDo NOT failover — may cause double pay.\nQuery partner reference first.
+  DW -> Rail  : GET /status?ref=<Idempotency-Key>
+
+  alt Resolves SETTLED
+    Rail --> DW : settled
+    DW -> DB    : UPDATE status = SETTLED\nINSERT payout_audit (to=SETTLED)
+    DW -> K     : publish payout.settled
+    K --> WD    : consume → webhook to merchant
+  else Resolves FAILED
+    Rail --> DW : not found / failed
+    DW -> DB    : UPDATE status = FAILED\nINSERT payout_audit (to=FAILED)
+    DW -> K     : publish payout.failed
+    K --> WD    : consume → webhook to merchant
+  end
+end
+
+== 5. Refund (triggered for every FAILED / RETURNED from SUBMITTED) ==
+
+K  -> RW : consume payout.failed | payout.returned
+RW -> DB : UPDATE status = REFUND_PENDING\nINSERT payout_audit (to=REFUND_PENDING, duration_ms)
+
+RW -> PayRail : push refund to caller\n(reverse of the original pull)
+
+alt Refund SUCCEEDS
+  PayRail --> RW : settled
+  RW -> DB      : UPDATE status = REFUNDED\nINSERT payout_audit (to=REFUNDED, duration_ms)
+  RW -> K       : publish payout.refunded
+  K --> WD      : consume → webhook to merchant
+  note right of RW #e4efe6 : Terminal.\nAudit trail: pull→failed→refunded.
+
+else Refund FAILS
+  PayRail --> RW : error
+  RW -> DB      : UPDATE status = REFUND_FAILED\nINSERT payout_audit (to=REFUND_FAILED, duration_ms)
+  RW -> K       : publish payout.refund_failed
+  note right of RW #f1dcd6 : ALERT: REFUND_FAILED_ANY\nMoney with Boku — page oncall.\nNo ack window. Manual resolution.
+end
 
 @enduml

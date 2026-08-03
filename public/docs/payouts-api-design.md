@@ -1,73 +1,61 @@
 # Payouts API — High-Level Design
 
 > Take-home task for Boku (Banking & Settlement). Prepared for HM walkthrough.
-> Structure: Requirements & assumptions → Terminology → Implementation principles (incl. endpoints, schemas, failure handling, status tracking) → AWS mapping → Tech stack.
+> Structure: Requirements & assumptions → Terminology → Implementation principles (endpoints, schemas, state machine, failure handling, compliance gate, fund pull, refund, status tracking, idempotency) → AWS mapping → Tech stack → Stakeholder coverage.
 
 ---
 
-## 1. Requirement + Top 3 Assumptions
+## 1. Requirements + Assumptions
 
 ### Requirement (as given)
 Design a Payouts API that lets a caller submit a payout to a beneficiary, exposes clear endpoints and request/response contracts, handles duplicate requests / failed disbursements / partial failures, and lets the caller track status after submission.
 
-### Top 3 assumptions (and the scenario each one resolves)
+### Assumptions (4 — each resolves a scenario the task leaves open)
 
 **Assumption 1 — Submission is synchronous, settlement is not.**
-*Scenario:* A caller hits `POST /payouts`. The actual movement of funds through a downstream bank/card/wallet rail can take anywhere from seconds to multiple business days.
-*Assumption:* The API acknowledges **acceptance** synchronously (`202 Accepted` + a payout ID), and the caller tracks the real outcome asynchronously (poll or webhook). I'm assuming callers cannot tolerate an HTTP call blocking for the full settlement time.
-*Alternative considered:* Fully synchronous confirm-then-respond — rejected, because it couples API availability to partner rail latency/uptime, which is exactly the kind of coupling DASH's FX/partner failover design was built to avoid.
+*Scenario:* A caller hits `POST /payouts`. The actual movement of funds through a downstream bank/card/wallet rail can take seconds to multiple business days.
+*Assumption:* The API acknowledges **acceptance** synchronously (`202 Accepted` + a payout ID), and the caller tracks the real outcome asynchronously (poll or webhook). The acceptance path must complete well within the API Gateway's timeout limit (e.g. 30s) — and it does, because the acceptance write is a thin DB insert + fire-and-forget Kafka publish, designed to complete in under 50ms P95.
+*Alternative considered:* Fully synchronous confirm-then-respond — rejected because it couples API availability to partner rail latency/uptime, which is exactly the kind of coupling DASH's FX/partner failover design was built to avoid.
 
 **Assumption 2 — Single-payout is the primary unit; batch is additive, not foundational.**
-*Scenario:* Boku's JD doesn't specify whether payouts arrive one at a time (e.g., a marketplace paying one seller) or as a payroll-style batch (e.g., paying 10,000 gig workers at once).
-*Assumption:* I'm designing the core resource as **one payout = one API call**, with a separate `POST /payouts/batch` as an additive wrapper that fans out into individual payout records — because it's cleaner to get single-resource idempotency and state tracking right first, then compose it, rather than starting from batch semantics and bolting on single-payout as a special case.
-*Alternative considered:* Batch-first design (file upload, job ID) — plausible if Boku's actual merchant customers are payroll-style, worth confirming with the interviewer live.
+*Scenario:* Boku's JD doesn't specify whether payouts arrive one at a time (e.g. a marketplace paying one seller) or as a payroll-style batch (e.g. paying 10,000 gig workers at once).
+*Assumption:* Core resource is **one payout = one API call**, with a separate `POST /payouts/batch` as an additive wrapper that fans out into individual payout records — cleaner to get single-resource idempotency and state tracking right first, then compose, rather than starting from batch semantics and bolting on single-payout as a special case.
+*Alternative considered:* Batch-first design (file upload, job ID) — plausible if Boku's merchant customers are payroll-style. Worth confirming live.
 
 **Assumption 3 — Rail selection is the platform's responsibility, not the caller's.**
-*Scenario:* Boku is global (65 countries per the JD) — a payout to Singapore vs. Kenya vs. the US likely rides completely different rails (local bank transfer, mobile money, card push).
-*Assumption:* The caller specifies **what** and **to whom** (amount, currency, beneficiary), not **how** (which rail/partner). Rail selection is the platform's job, mirroring how DASH's FX orchestration picked and failed over between Thunes/Tranglo/WU without the caller knowing.
+*Scenario:* Boku is global (65 countries) — a payout to Singapore vs. Kenya vs. the US rides completely different rails (local bank transfer, mobile money, card push).
+*Assumption:* The caller specifies **what** and **to whom** (amount, currency, beneficiary), not **how** (which rail/partner). Rail selection and failover is the platform's job, mirroring how DASH's FX orchestration picked and failed over between Thunes/Tranglo/WU without the caller knowing.
 
-**Why not caller-selects-rail?** This is a real, legitimate model — Stripe, Wise, and some B2B treasury platforms expose it explicitly. It makes sense when the platform's value proposition is "connectivity layer, you control the routing." I'm ruling it out as the *default* here because Boku's value proposition reads differently: 65-country coverage, global corridor management, partner relationships the merchant doesn't have — the platform's job is to abstract that complexity away, not expose it. Letting a caller specify `"rail": "LOCAL_BANK_SG"` throws that abstraction away, and now every merchant needs to know Boku's partner topology per corridor, which couples the public API contract to internal infra decisions. That said, I'd keep an optional `preferred_rail` hint for edge cases where a specific caller genuinely needs it.
+**Why not caller-selects-rail?** This is a real, legitimate model — Stripe, Wise, and some B2B treasury platforms expose it explicitly. I'm ruling it out as the default here because Boku's value proposition reads differently: 65-country coverage, global corridor management, partner relationships the merchant doesn't have. Letting a caller specify `"rail": "LOCAL_BANK_SG"` leaks internal partner topology into a public contract and couples the API to internal infra decisions. I'd keep an optional `preferred_rail` hint for edge cases. **Worth confirming live** — see open questions below.
 
-*Alternative considered:* Caller-selects-rail — valid if Boku's product is a connectivity/aggregation layer rather than a managed payout service. **Worth confirming live** — see open question below.
-
-**Assumption 4 — Funding model: prefunded wallet, not atomic pull-and-pay.**
-*Scenario:* Before Boku can disburse to a beneficiary, the money has to come from somewhere. There are two real-world models:
+**Assumption 4 — Pull-and-Pay as the primary funding model, showcased in full.**
+*Scenario:* Before Boku can disburse to a beneficiary, the money has to come from somewhere. Two real-world models exist:
 
 | Model | How it works | Design impact |
 |---|---|---|
-| **Prefunded wallet** (my assumption) | Merchant tops up a Boku-held balance in advance. `POST /payouts` checks and debits the wallet atomically before queuing disbursement. | `POST /payouts` can reject synchronously with `INSUFFICIENT_FUNDS`. Needs a `Wallet` resource and `POST /wallets/topup`. Two-ledger: wallet ledger + payout ledger. |
-| **Atomic pull-and-pay** | `POST /payouts` triggers both a debit on the caller's payment account and the disbursement to the beneficiary in a single coordinated flow. No pre-funding step. | Simpler for the caller — one API call does everything. But now `POST /payouts` has two failure surfaces (pull fails, or disbursement fails), and a failed pull means neither side moves. Requires Boku to hold a direct debit mandate on the caller's account. |
+| **Prefunded wallet** | Merchant tops up a Boku-held balance in advance. `POST /payouts` checks + debits wallet atomically. | Synchronous `INSUFFICIENT_FUNDS` rejection. Needs wallet resource. Simpler failure handling — no refund flow. |
+| **Pull-and-Pay** (primary) | `POST /payouts` accepts async; the platform debits the caller's account via direct debit mandate as a dedicated async step before disbursement. | Two failure surfaces (pull fails, disbursement fails). More complex — but demonstrates the full design including compliance gate, explicit fund pull state, and refund flow. |
 
-*Assumption:* I'm designing for **prefunded wallet** because it's the dominant model among B2B payout aggregators (Thunes, Airwallex, Rapyd) and it keeps `POST /payouts` semantically clean — by the time a payout is submitted, the funds are already Boku's to move. Atomic pull-and-pay is more elegant for the caller but introduces a two-phase money movement inside a single API call, which complicates failure handling significantly.
+*Why Pull-and-Pay as the showcase:* it forces the complete design — compliance gate, `FUND_PULLING` as a separate state, refund path, and the key insight that separating fund pull from disbursement eliminates the need for a `funds_pulled` flag entirely. Every failure from `SUBMITTED` unconditionally triggers a refund. This is more representative of a real platform's complexity than the prefunded model, which collapses multiple concerns into a simpler but less instructive flow.
 
-*What this adds to the prefunded model:*
-- `POST /wallets/topup` — merchant initiates a fund transfer into their Boku wallet (out of scope for this design iteration, but named)
-- Balance check inside `POST /payouts` — atomic with the idempotency dedup check: deduct from wallet + create payout in one transaction, or reject with `INSUFFICIENT_FUNDS`
-- `INSUFFICIENT_FUNDS` as a new synchronous `422` rejection — the only case where `POST /payouts` fails without creating a payout record
+*Prefunded wallet remains valid* — worth confirming with the interviewer which model Boku actually uses. If prefunded, the design simplifies: remove `FUND_PULLING`, `FUND_PULL_FAILED`, and the refund flow; add wallet debit in the acceptance transaction and synchronous `INSUFFICIENT_FUNDS`.
 
-*Alternative considered:* Atomic pull-and-pay — valid, especially for embedded finance or marketplace platforms where the caller's funds are already in a Boku-connected account. See diagram in the sidebar for how the flow differs. **Worth confirming live** — see open question below.
+### Open questions for the walkthrough
 
-### Open question for the walkthrough (not an assumption — a thing to confirm live)
-
-**Question 1 — Is the platform a managed payout service or a connectivity layer?**
-
-This determines whether Assumption 3 holds at all:
+**Q1 — Managed payout service or connectivity layer?**
 
 | Model | Who picks the rail | Design impact |
 |---|---|---|
-| **Managed payout service** (my assumption) | Platform, invisibly | Rail selection + failover is internal; caller API stays simple |
-| **Connectivity layer** | Caller specifies upfront | Rail selection layer removed entirely; simpler design, different product |
+| **Managed service** (assumed) | Platform, invisibly | Rail selection + failover internal; caller API stays simple |
+| **Connectivity layer** | Caller specifies upfront | Rail selection removed entirely; `SUBMITTED_UNCONFIRMED` stays, failover-blocking in §3.9 goes away |
 
-If it's the connectivity model, I'd remove the rail-selection layer, keep `SUBMITTED_UNCONFIRMED` (a connection drop is still a connection drop regardless of who picked the rail), but drop the failover-blocking logic in §3.9 entirely — there is no rail 2 to fail over to.
+**Q2 — If platform-picks-rail: priority-ordered fallback or genuinely multi-rail?**
+- **Priority-ordered fallback** — circuit breaker trips on primary, switches to next in list. Most common. §3.9 ambiguous-failure guard applies in full.
+- **Genuinely multi-rail** — scoring per payout (cost, speed, success rate). Needs a selection/scoring step not currently designed.
 
-**Question 2 — If platform-picks-rail: single primary with fallback, or genuinely multi-rail?**
-
-Assuming Assumption 3 holds, there are still two materially different sub-models:
-
-- **Priority-ordered fallback** — a circuit breaker trips on the primary and switches wholesale to the next rail in the list. Most common in practice.
-- **Genuinely multi-rail** — multiple candidate rails scored per payout (cost, speed, success rate), not just a fallback chain.
-
-This changes the failure-handling design directly: the priority-list model needs the ambiguous-failure guard in §3.9 (don't fail over to rail 2 while rail 1's outcome is still unknown); a true multi-rail model needs a selection/scoring step I haven't designed here. I'd rather surface this as a live question than silently assume one.
+**Q3 — Prefunded wallet or Pull-and-Pay?**
+- Prefunded → remove `FUND_PULLING` / refund flow, add wallet debit in acceptance transaction, synchronous `INSUFFICIENT_FUNDS`
+- Pull-and-Pay → current design; two failure surfaces, refund flow, explicit fund pull state
 
 ---
 
@@ -80,26 +68,28 @@ This changes the failure-handling design directly: the priority-list model needs
 | **Disbursement / Rail / Partner** | The downstream network actually moving the money (bank transfer network, card scheme, mobile wallet). A payout is *fulfilled by* a disbursement. |
 | **Idempotency Key** | A caller-supplied unique token guaranteeing that retrying the same request never creates a second payout. |
 | **Payout State Machine** | The explicit set of statuses a payout moves through, with defined legal transitions (see §3.3). |
-| **Terminal state** | A state the payout cannot leave (`SETTLED`, `FAILED`, `RETURNED`). Non-terminal states can still change. |
+| **Terminal state** | A state the payout cannot leave (`SETTLED`, `FAILED`, `RETURNED`, `REFUNDED`, `REFUND_FAILED`, `FUND_PULL_FAILED`, `REJECTED_COMPLIANCE`, `CANCELLED`). |
 | **Partial failure** | In a batch, some payouts succeed and others fail independently — the batch itself has no single pass/fail outcome. |
 | **Reconciliation** | Matching Boku's internal payout records against the partner's own settlement/callback records to catch silent discrepancies. |
-| **Ledger entry** | An immutable, append-only record of a funds-movement event, used as the source of truth (vs. mutable payout status, which is a projection). |
+| **Ledger entry** | An immutable, append-only record of a funds-movement event — source of truth. The mutable `status` column is a projection of the ledger. |
+| **Audit table** | Append-only `payout_audit` table — one row per state transition, recording `from_status`, `to_status`, `duration_ms`, `triggered_by`, `correlation_id`. Drives per-step SLA monitoring and proactive alerting. |
 | **Quote** | An ephemeral, short-TTL FX rate lock + preview, obtained *before* a payout is created — not part of the payout ledger. |
-| **Partner reference** | The client-generated reference sent to a disbursement partner on every outbound call — reused from the Idempotency-Key — so an ambiguous outcome can be resolved by querying the partner's own system, not just by retrying. |
-| **Correlation ID** | An ID threaded through every log line, event, and span for one specific execution attempt — distinct from the Idempotency-Key, which spans every retry of one logical request. |
-| **Webhook / callback** | An async, platform-initiated push notification to the caller when a payout's status changes. |
-| **Wallet / prefunded balance** | A Boku-held balance belonging to the caller, debited atomically when a payout is accepted. The source of funds for disbursement in the prefunded model. |
-| **Atomic pull-and-pay** | An alternative funding model where `POST /payouts` triggers both a debit on the caller's external account and the beneficiary disbursement in one coordinated flow — no separate top-up step. |
-| **Compliance gate** | An async fraud + AML/sanctions check that runs after `202 Accepted` but before any funds move. The payout sits in `PENDING_COMPLIANCE` until the gate passes or blocks. |
-| **`PENDING_COMPLIANCE`** | Non-terminal state: payout accepted, compliance checks in progress, no funds moved yet. |
-| **`REJECTED_COMPLIANCE`** | Terminal state: compliance gate blocked the payout (sanctions match, fraud score exceeded, PEP detected). Distinct from `FAILED` — this is a legal/policy block, not a rail issue. |
-| **`PENDING_MANUAL_REVIEW`** | Non-terminal state: compliance returned a soft hit (partial match, PEP flag) — a human reviewer must approve or reject before the payout can proceed. |
-| **Hard hit / Soft hit** | AML screening outcomes. Hard hit = definitive sanctions match → auto-reject. Soft hit = partial match or PEP detected → route to manual review queue. |
-| **`FUND_PULLING`** | Non-terminal state (Pull-and-Pay only): compliance passed, the platform is now debiting the caller's account before disbursement begins. Separating this from `SUBMITTED` means if `SUBMITTED` is ever reached, funds are always with Boku — no flag needed. |
-| **`FUND_PULL_FAILED`** | Terminal state: the debit on the caller's account failed (insufficient funds, mandate revoked). No funds moved — no refund required. |
-| **`REFUND_PENDING`** | Non-terminal state (Pull-and-Pay only): disbursement failed after funds were pulled; a refund payment back to the caller is in progress. |
-| **`REFUNDED`** | Terminal state: caller's funds have been successfully returned. Full audit trail preserved: pull → failed → refunded. |
-| **`REFUND_FAILED`** | Terminal state: refund attempt to the caller also failed. Money is with Boku — neither beneficiary nor caller holds it. Requires immediate manual ops intervention. |
+| **Partner reference** | The Idempotency-Key reused on every outbound rail call — enables outcome lookup when a connection drops mid-call, without guessing. |
+| **Correlation ID** | An ID threaded through every log line, Kafka event, and span for one specific execution attempt — distinct from the Idempotency-Key, which spans every retry of one logical payout. |
+| **Webhook / callback** | An async, platform-initiated push notification to the caller when a payout's status changes. Convenience layer — never the source of truth. |
+| **Compliance gate** | Async fraud + AML/sanctions checks that run after `202 Accepted` but before any funds move. Payout sits in `PENDING_COMPLIANCE` until the gate passes or blocks. |
+| **Hard hit / Soft hit** | AML screening outcomes. Hard hit = definitive sanctions match → auto-reject to `REJECTED_COMPLIANCE`. Soft hit = partial match or PEP detected → `PENDING_MANUAL_REVIEW`. |
+| **Wallet / prefunded balance** | A Boku-held balance belonging to the caller, debited atomically at acceptance in the prefunded model. |
+| **Pull-and-Pay** | Funding model where the platform debits the caller's account via direct debit mandate as a dedicated async step (`FUND_PULLING`) before disbursement. |
+| **`PENDING_COMPLIANCE`** | Non-terminal: payout accepted, fraud + AML checks running, no funds moved. |
+| **`PENDING_MANUAL_REVIEW`** | Non-terminal: AML soft hit — human reviewer must approve or reject before payout proceeds. |
+| **`REJECTED_COMPLIANCE`** | Terminal: compliance blocked the payout. Legal/policy block — distinct from `FAILED` (rail issue). No funds moved, no refund required. May trigger regulatory reporting. |
+| **`FUND_PULLING`** | Non-terminal (Pull-and-Pay): debiting caller's account. Separating this from `SUBMITTED` means reaching `SUBMITTED` guarantees funds are with Boku — no flag check needed anywhere. |
+| **`FUND_PULL_FAILED`** | Terminal: caller's account debit failed (insufficient funds, mandate revoked). No funds moved — no refund required. |
+| **`SUBMITTED_UNCONFIRMED`** | Non-terminal: connection to partner rail dropped mid-call — outcome unknown. Must resolve via partner-reference lookup before any failover or refund decision. |
+| **`REFUND_PENDING`** | Non-terminal (Pull-and-Pay): disbursement failed after `SUBMITTED` — Boku holds caller's money, refund in progress. |
+| **`REFUNDED`** | Terminal: caller's funds successfully returned. Audit trail: pull → failed → refunded. |
+| **`REFUND_FAILED`** | Terminal: refund also failed. Money with Boku — neither beneficiary nor caller holds it. Page oncall immediately. |
 
 ---
 
@@ -109,24 +99,25 @@ This changes the failure-handling design directly: the priority-list model needs
 
 | Endpoint | Purpose | Reasoning |
 |---|---|---|
-| `POST /payouts` | Submit a single payout | Core resource creation. Requires `Idempotency-Key` header. |
-| `GET /payouts/{payoutId}` | Fetch current status + full lifecycle | Primary status-tracking mechanism; cacheable, cheap to poll. |
-| `GET /payouts?external_ref={ref}` | Look up a payout by the caller's own reference | Callers often lose the returned `payoutId` (crashed before persisting it) — need a recovery path keyed on *their* identifier, not just ours. |
-| `POST /payouts/batch` | Submit multiple payouts as one call | Additive per Assumption 2; internally decomposes into N individual payout records, each independently tracked. |
-| `GET /payouts/batch/{batchId}` | Batch-level rollup status | Surfaces partial-failure counts (`succeeded: 8, failed: 2, pending: 0`) without hiding individual outcomes. |
-| `POST /payouts/{payoutId}/cancel` | Cancel a payout still in a cancellable state | Payments-specific: cancellation must be rejected once a payout has left a cancellable state — this is a state-machine guard, not a soft delete. |
-| `POST /webhooks/subscriptions` | Register a callback URL for status-change events | Push-based status tracking, complementary to polling. |
-| `POST /quotes` | Lock an FX rate + preview a payout before it's created | Optional pre-step for cross-currency payouts — see §3.8. Not part of the payout ledger. |
-| `GET /quotes/{quoteId}` | Fetch a previously issued quote | Lets a caller re-check a quote's remaining validity before submitting the payout that references it. |
+| `POST /payouts` | Submit a single payout | Core resource creation. Requires `Idempotency-Key` header. Returns `202` — acceptance only, not settlement. |
+| `GET /payouts/{payoutId}` | Fetch current status + full lifecycle history | Primary status-tracking mechanism. Always correct — source of truth even if all webhooks failed. |
+| `GET /payouts?external_ref={ref}` | Look up a payout by the caller's own reference | Recovery path when the caller crashed before persisting `payoutId` — keyed on their identifier, not ours. |
+| `POST /payouts/batch` | Submit multiple payouts as one call | Additive per Assumption 2; fans out to N independent payout records, each with its own state machine. |
+| `GET /payouts/batch/{batchId}` | Batch-level rollup status | Surfaces `succeeded/failed/pending` counts without hiding individual outcomes — partial failure is the expected case. |
+| `POST /payouts/{payoutId}/cancel` | Cancel a payout still in a cancellable state | State-machine guard, not a soft delete. Only `PENDING` payouts are cancellable — idempotent on already-cancelled. |
+| `POST /webhooks/subscriptions` | Register a callback URL for status-change events | Push-based tracking, complementary to polling. HMAC-signed deliveries. |
+| `POST /quotes` | Lock an FX rate + preview before creating a payout | Optional pre-step for cross-currency payouts. TTL-bound — referencing an expired quote returns `QUOTE_EXPIRED`. |
+| `GET /quotes/{quoteId}` | Fetch a previously issued quote | Check remaining validity before submitting the payout that references it. |
+| `POST /wallets/topup` | Merchant tops up their Boku-held balance | Prefunded model only — named but out of scope for this design iteration. |
 
-I did **not** expose a `DELETE /payouts/{id}` — funds-movement records are never deleted, only transitioned to a terminal state. This is a deliberate omission, not an oversight.
+`DELETE /payouts/{id}` is deliberately absent — funds-movement records are never deleted, only transitioned to terminal states.
 
 ### 3.2 Request / response structures
 
 **Submit a payout**
 ```
 POST /payouts
-Idempotency-Key: 6f1c1e2a-...   (required, caller-generated, unique per logical payout)
+Idempotency-Key: 6f1c1e2a-...   (required — caller-generated, stable across all retries)
 
 {
   "external_reference": "invoice-8842",
@@ -139,227 +130,273 @@ Idempotency-Key: 6f1c1e2a-...   (required, caller-generated, unique per logical 
     "country": "SG"
   },
   "purpose": "SUPPLIER_PAYMENT",
+  "quote_id": "qte_DEMO_001",      (optional — FX rate lock for cross-currency)
   "metadata": { "order_id": "ord_9981" }
 }
 ```
 
-**Response — 202 Accepted**
+**Response — 202 Accepted** (acceptance only, not settlement)
 ```
 {
   "payout_id": "pyo_01HZX...",
   "status": "PENDING",
   "external_reference": "invoice-8842",
   "amount": { "value": "150.00", "currency": "SGD" },
-  "created_at": "2026-08-01T09:00:00Z",
+  "created_at": "2026-08-03T09:00:00Z",
   "links": { "self": "/payouts/pyo_01HZX..." }
 }
 ```
 
-**Status fetch — `GET /payouts/{id}`**
+**Status fetch — `GET /payouts/{id}` — full lifecycle history**
 ```
 {
   "payout_id": "pyo_01HZX...",
-  "status": "FAILED",
-  "failure_reason": "BENEFICIARY_ACCOUNT_INVALID",
+  "status": "SETTLED",
+  "external_reference": "invoice-8842",
+  "amount": { "value": "150.00", "currency": "SGD" },
+  "settled_at": "2026-08-03T09:00:09Z",
   "history": [
-    { "status": "PENDING",   "at": "2026-08-01T09:00:00Z" },
-    { "status": "SUBMITTED", "at": "2026-08-01T09:00:02Z" },
-    { "status": "FAILED",    "at": "2026-08-01T09:00:11Z", "reason": "BENEFICIARY_ACCOUNT_INVALID" }
+    { "status": "PENDING",             "at": "2026-08-03T09:00:00Z" },
+    { "status": "PENDING_COMPLIANCE",  "at": "2026-08-03T09:00:00Z", "duration_ms": 480 },
+    { "status": "FUND_PULLING",        "at": "2026-08-03T09:00:02Z", "duration_ms": 1840 },
+    { "status": "SUBMITTED",           "at": "2026-08-03T09:00:04Z", "duration_ms": 2100 },
+    { "status": "SETTLED",             "at": "2026-08-03T09:00:09Z", "duration_ms": 3650 }
   ]
 }
 ```
 
-Every error response uses a consistent shape (`error_code`, `message`, `request_id`) so callers can branch on `error_code` programmatically rather than parsing prose.
+**Failed payout with refund**
+```
+{
+  "payout_id": "pyo_02HZX...",
+  "status": "REFUNDED",
+  "failure_reason": "BENEFICIARY_ACCOUNT_INVALID",
+  "history": [
+    { "status": "PENDING",            "at": "2026-08-03T09:05:00Z" },
+    { "status": "PENDING_COMPLIANCE", "at": "2026-08-03T09:05:00Z", "duration_ms": 510 },
+    { "status": "FUND_PULLING",       "at": "2026-08-03T09:05:02Z", "duration_ms": 1920 },
+    { "status": "SUBMITTED",          "at": "2026-08-03T09:05:04Z", "duration_ms": 2050 },
+    { "status": "FAILED",             "at": "2026-08-03T09:05:09Z", "duration_ms": 4300,
+      "reason": "BENEFICIARY_ACCOUNT_INVALID" },
+    { "status": "REFUND_PENDING",     "at": "2026-08-03T09:05:09Z", "duration_ms": 180 },
+    { "status": "REFUNDED",           "at": "2026-08-03T09:05:13Z", "duration_ms": 3600 }
+  ]
+}
+```
+
+Every error response uses a consistent shape (`error_code`, `message`, `request_id`) — callers branch on `error_code` programmatically, never on prose.
 
 ### 3.3 Payout state machine
 
 ```
 PENDING → PENDING_COMPLIANCE → FUND_PULLING → SUBMITTED → SETTLED    (happy path, compliance + pull-and-pay)
-PENDING → FUND_PULLING → SUBMITTED → SETTLED                          (happy path, no compliance gate)
-PENDING → SUBMITTED → SETTLED                                         (happy path, prefunded wallet)
+PENDING → FUND_PULLING → SUBMITTED → SETTLED                          (no compliance gate required)
+PENDING → SUBMITTED → SETTLED                                         (prefunded wallet — no fund pull step)
 
-PENDING_COMPLIANCE → FUND_PULLING                                     (compliance passes)
+PENDING_COMPLIANCE → FUND_PULLING                                     (fraud + AML pass)
 PENDING_COMPLIANCE → REJECTED_COMPLIANCE                              (hard hit — terminal, no funds moved)
 PENDING_COMPLIANCE → PENDING_MANUAL_REVIEW                            (soft hit — human review)
-PENDING_MANUAL_REVIEW → FUND_PULLING | REJECTED_COMPLIANCE            (reviewer decides)
+PENDING_MANUAL_REVIEW → FUND_PULLING | REJECTED_COMPLIANCE            (reviewer approves or rejects)
 
 FUND_PULLING → SUBMITTED                                              (pull succeeds — funds with Boku)
-FUND_PULLING → FUND_PULL_FAILED                                       (pull fails — terminal, no refund needed)
+FUND_PULLING → FUND_PULL_FAILED                                       (pull fails — terminal, no refund)
 
-SUBMITTED → SETTLED                                                   (rail confirms)
-SUBMITTED → FAILED                                                    (rail rejects — non-retryable)
-SUBMITTED → RETURNED                                                  (rail accepted, later reversed)
+SUBMITTED → SETTLED                                                   (rail confirms — terminal)
+SUBMITTED → FAILED                                                    (rail rejects non-retryable — terminal)
+SUBMITTED → RETURNED                                                  (rail accepted, later reversed — terminal)
 SUBMITTED → SUBMITTED_UNCONFIRMED                                     (connection dropped — outcome unknown)
-SUBMITTED_UNCONFIRMED → SETTLED | FAILED                              (resolved via partner-reference lookup only)
+SUBMITTED_UNCONFIRMED → SETTLED | FAILED                              (partner-reference lookup only — never guessed)
 
-FAILED   → REFUND_PENDING                                             (Pull-and-Pay: SUBMITTED reached = funds always with Boku)
-RETURNED → REFUND_PENDING                                             (Pull-and-Pay: rail reversed after pull)
+FAILED   → REFUND_PENDING                                             (SUBMITTED reached = funds always with Boku)
+RETURNED → REFUND_PENDING                                             (rail reversed after pull)
 REFUND_PENDING → REFUNDED                                             (refund to caller succeeds — terminal)
-REFUND_PENDING → REFUND_FAILED                                        (refund also fails — terminal, manual intervention)
+REFUND_PENDING → REFUND_FAILED                                        (refund fails — terminal, manual intervention)
 
 PENDING → CANCELLED                                                   (caller cancels before submission — terminal)
 ```
 
 See the **State Machine diagram** in the sidebar for the full visual.
 
-**Why `FUND_PULLING` as a separate state simplifies the design:**
-Separating fund pull from disbursement means that if `SUBMITTED` was reached, funds are *always* with Boku — no `funds_pulled` flag needed anywhere. Every `FAILED` or `RETURNED` from `SUBMITTED` unconditionally triggers a refund. The disbursement worker does one thing only: send money to the beneficiary.
+**Why `FUND_PULLING` as a separate state eliminates a flag:**
+Once `SUBMITTED` is reached, funds are *always* with Boku — by definition. No `funds_pulled` boolean needed anywhere. Every `FAILED` or `RETURNED` from `SUBMITTED` unconditionally triggers a refund. The disbursement worker does exactly one thing: send money to the beneficiary.
 
-**Refund trigger — simplified:**
+**Compliance gate — placement and sequencing:**
+Runs after `202 Accepted`, before any funds move. Two checks in sequence:
+- **Fraud screening** — velocity, amount anomalies, beneficiary pattern. Fast, automated, binary.
+- **AML / sanctions scan** — OFAC, UN, EU, local lists. Hard hit → `REJECTED_COMPLIANCE` (auto). Soft hit → `PENDING_MANUAL_REVIEW` (human decision).
+
+`REJECTED_COMPLIANCE` is deliberately separate from `FAILED`. `FAILED` = rail issue, potentially retryable. `REJECTED_COMPLIANCE` = legal/policy block, no retry will change the outcome, may trigger regulatory reporting obligation.
+
+**Refund trigger — simplified by the `FUND_PULLING` separation:**
 
 | State | Refund needed? | Why |
 |---|---|---|
 | `REJECTED_COMPLIANCE` | No | Compliance runs before any funds move |
-| `FUND_PULL_FAILED` | No | Pull failed — caller's account never debited |
+| `FUND_PULL_FAILED` | No | Caller's account was never debited |
 | `FAILED` (from `SUBMITTED`) | Yes — always | `SUBMITTED` means funds are with Boku |
 | `RETURNED` (from `SUBMITTED`) | Yes — always | Rail reversed after Boku already held funds |
-| `SUBMITTED_UNCONFIRMED → FAILED` | Yes — after lookup resolves | Wait for partner-reference resolution first |
+| `SUBMITTED_UNCONFIRMED → FAILED` | Yes — after lookup resolves | Do not refund while outcome is unknown |
 
-`REFUND_FAILED` is the most serious ops state — money is with Boku, not with the beneficiary or the caller. Must have a defined alerting threshold (e.g., page oncall within 5 minutes of entering this state).
+`REFUND_FAILED` is the most serious ops state — money is with Boku, held by neither party. Must page oncall immediately with no acknowledgement window. See the **Traffic Model, SLA & Proactive Alerting** doc for full alert definitions.
 
-Every transition is a single-writer update guarded by the current state (`UPDATE ... WHERE status = 'X'`), so two concurrent workers can never both advance the same payout — this is the same class of guard I used for the Dash transaction state machine.
+**Single-writer guard on every transition:**
+Every state update is guarded by `UPDATE ... WHERE status = 'X'` — two concurrent workers can never both advance the same payout. A duplicate Kafka event landing on the same worker becomes a no-op, not a double transition.
 
-**On `PENDING_COMPLIANCE`:** the compliance gate runs *after* `202 Accepted` but *before* any funds move. This is the correct placement — the caller gets an immediate acknowledgement, and the platform runs fraud/AML checks async without blocking the API on a scan that may take seconds. The gate is optional per corridor or payout type: low-risk, same-currency payouts below a threshold may skip it; high-value or cross-border payouts always go through.
-
-**Two checks, sequenced:**
-- **Fraud screening** — velocity checks, amount anomalies, beneficiary pattern matching. Fast, automated, binary pass/fail.
-- **AML / sanctions scan** — screen beneficiary against OFAC, UN, EU, and local sanctions lists. Mandatory for cross-border. A *hard hit* (exact match) auto-rejects to `REJECTED_COMPLIANCE`; a *soft hit* (partial match, PEP detected) routes to `PENDING_MANUAL_REVIEW` for a human decision.
-
-**`REJECTED_COMPLIANCE` is deliberately separate from `FAILED`.** `FAILED` means a rail issue — a transient or retryable problem in the disbursement layer. `REJECTED_COMPLIANCE` means a legal/policy block — no amount of retrying will change the outcome, and the rejection reason (`SANCTIONS_MATCH`, `FRAUD_SCORE_EXCEEDED`, `PEP_DETECTED`) has different downstream implications (regulatory reporting, account review) that must not be conflated with a bank timeout.
-
-`SUBMITTED_UNCONFIRMED` is deliberately non-terminal and deliberately not `FAILED` — a connection drop mid-call to the partner tells you nothing about whether they actually processed it. Guessing either way is wrong: retrying blind risks a duplicate disbursement, marking it `FAILED` risks paying out twice if the partner actually succeeded. It can only be resolved by looking, not by waiting or assuming — see §3.9.
+`SUBMITTED_UNCONFIRMED` is deliberately non-terminal and deliberately not `FAILED` — a connection drop tells you nothing about whether the partner processed it. Do not refund. Do not failover. Query the partner using the `client_reference` (= Idempotency-Key) to resolve. See §3.9.
 
 ### 3.4 Failure handling
 
 **Duplicate payout requests.**
-The `Idempotency-Key` is stored with a uniqueness constraint alongside the resulting `payout_id`. A retried request with the same key returns the **original** response (same `payout_id`, same status) instead of creating a second payout — the caller cannot tell, from the response alone, whether their request was new or a replay, which is the point. Keys expire after a bounded window (e.g., 24h) to avoid unbounded storage growth.
+The `Idempotency-Key` is stored with a uniqueness constraint in the same Postgres transaction as the payout INSERT. A retried request with the same key returns the original `202` response — the caller cannot tell whether it was new or a replay, which is the point. Redis provides a sub-millisecond fast-path check; Postgres is the durable guarantee. Keys expire after 24h.
+
+**API Gateway timeout (30s).**
+The acceptance path (`POST /payouts`) is designed to complete in under 50ms P95 — a thin DB write + fire-and-forget Kafka publish. If the gateway times out before the `202` reaches the caller, the payout may or may not have been created. The caller retries with the same `Idempotency-Key` — dedup returns the original response if it was created, creates it fresh if not. No new state or logic needed; the Idempotency-Key already handles this.
+
+**Compliance rejection.**
+Hard sanctions match → `REJECTED_COMPLIANCE` (terminal, auto). Soft hit → `PENDING_MANUAL_REVIEW` (human review, SLA-bound). Both states confirm no funds moved — no refund required.
+
+**Fund pull failure.**
+`INSUFFICIENT_FUNDS` or `MANDATE_REVOKED` → `FUND_PULL_FAILED` (terminal). No money left the caller — no refund required. Caller is notified via webhook with a structured `failure_reason`.
 
 **Failed disbursements.**
-A rail rejection (invalid account, sanctions hold, insufficient partner liquidity) transitions the payout straight to `FAILED` with a structured `failure_reason` — no silent retries on non-retryable errors. Transient errors (partner timeout, 5xx) go through retry with exponential backoff + jitter, capped at N attempts, then a **circuit breaker** trips per-rail so one partner's outage doesn't cascade into every payout timing out. Attempts that exhaust retries land in a DLQ for manual/automated follow-up rather than disappearing.
+Rail rejection (invalid account, sanctions hold, partner liquidity) → `FAILED` (terminal). Because `SUBMITTED` was reached, funds are with Boku — refund flow triggers unconditionally. Transient errors (timeout, 5xx) retry with exponential backoff + jitter; exhausted retries land in a DLQ. Circuit breaker trips per-rail so one partner's outage doesn't cascade across all payouts.
+
+**Connection dropped mid-rail-call (`SUBMITTED_UNCONFIRMED`).**
+The outcome is unknown — neither assume success nor failure. Query the partner's status endpoint using the `client_reference` (= Idempotency-Key) to resolve. Only after resolution does the refund decision follow. Failover to another rail is blocked until resolution — sending to Partner B while Partner A's outcome is unknown is exactly how a system pays out twice.
 
 **Partial failures (batch).**
-Each payout inside a batch is its own state-machine instance. The batch resource is a read-only rollup (`succeeded/failed/pending` counts + links to each child payout) — it never has an all-or-nothing outcome. This avoids the failure mode where one bad beneficiary record blocks 999 good ones.
+Each payout inside a batch is its own state-machine instance. The batch resource is a read-only rollup (`succeeded/failed/pending` counts + links to child payouts) — never an all-or-nothing outcome.
+
+**Refund failure (`REFUND_FAILED`).**
+The refund push to the caller's account also failed. Money is with Boku. This is the only state with a zero-tolerance alert policy — page oncall with no ack window; manual reconciliation with finance required. See observability doc for `REFUND_FAILED_ANY` alert definition.
 
 ### 3.5 Status tracking after submission
 
-Two complementary mechanisms, not one:
-- **Pull**: `GET /payouts/{id}` — always correct, caller-paced, good for low-volume callers or backfilling after an outage.
-- **Push**: webhook on every status transition, with the caller's endpoint expected to respond `2xx` quickly and Boku retrying failed webhook deliveries with backoff (same DLQ pattern as partner-side failures).
+Two complementary mechanisms — neither replaces the other:
+- **Pull**: `GET /payouts/{id}` — always correct, caller-paced. The `history` array (sourced from `payout_audit`) gives full per-step timing. Good for backfilling after an outage or for low-volume callers.
+- **Push**: webhook on every state transition, HMAC-signed. Boku retries failed deliveries with backoff; exhausted deliveries land in a DLQ.
 
-Webhooks are a convenience layer, never the source of truth — `GET /payouts/{id}` must always reflect the true current state even if every webhook delivery failed. This mirrors the reconciliation principle: never let an async notification become the only record of what happened.
+Webhooks are a convenience layer — `GET /payouts/{id}` must always reflect true current state even if every webhook delivery failed.
 
 ### 3.6 Reconciliation
 
-A scheduled job matches Boku's internal ledger against each partner's own settlement report/callback feed, flagging discrepancies (partner says settled, we show pending; or vice versa) for automatic correction or manual review. This is the same shape as the DASH reconciliation flow — matching partner callbacks back to originating transactions — just generalized to N disbursement rails instead of N remittance hubs.
+A scheduled job matches Boku's internal `payout_audit` ledger against each partner's own settlement report/callback feed, flagging discrepancies for automatic correction or manual review. The `payout_audit` table's `partner_ref` column (= the Idempotency-Key sent to each rail) is the join key for this match. Same shape as DASH's reconciliation flow — generalized to N disbursement rails.
 
 ### 3.7 Quote vs. Payout — why this isn't a Create + Submit split
 
-A natural question: should `POST /payouts` itself be split into **Create** (preview) and **Submit** (confirm), the way a consumer remittance app shows a review screen before the user taps confirm?
+Boku's Payouts API is B2B infrastructure — the caller is a merchant backend, not an end user at a review screen. If a merchant wants their own user to review before paying, that happens in the merchant's UI. Boku is called once the user has confirmed.
 
-**Not for this API, and not for that reason.** Boku's Payouts API is B2B infrastructure — the caller is a merchant/platform's backend, not an end user looking at a screen. If a merchant wants *their own* user to review a beneficiary before triggering a payout, that review happens in the merchant's own UI, using data they already hold — they only call Boku once their user has actually confirmed. Modeling a caller-facing "double check" step inside the Payouts API solves a DASH-shaped (B2C) problem, not a Boku-shaped (B2B) one.
+The real reason for a two-step flow is **FX rate locking**, not human review:
+- `POST /quotes` → locked rate + fees, short TTL (60–120s)
+- `POST /payouts` optionally references `quote_id` — expired quote returns `QUOTE_EXPIRED`, not a silent re-price
+- No `quote_id` → platform prices at submission time (common path for same-currency payouts)
 
-**Where a split is still justified: FX rate locking, not human review.**
-Cross-currency payouts (likely, given Boku's global footprint) need the exchange rate committed to *before* execution — the platform can't disburse at a stale rate. That's the real reason for a two-step flow, and it's solved with a separate, ephemeral **Quote** resource rather than by splitting the payout itself:
-
-- `POST /quotes` → returns a locked rate, computed fees, and beneficiary preview, with a short TTL (e.g. 60–120s).
-- `POST /payouts` optionally references `quote_id` — if the quote has expired, the payout is rejected with a specific error (`QUOTE_EXPIRED`) rather than silently re-pricing.
-- No `quote_id` provided → the platform prices at submission time; this is the common path for same-currency or system-to-system payouts with no rate-sensitivity.
-
-**Abandonment/funnel analytics falls out of this for free — without polluting the ledger.**
-A payout ledger is a financial system of record — every row should correspond to a real, intended money movement, because reconciliation and audit depend on that invariant. If "create" wrote a payout-ledger row that might never be submitted, you'd be mixing "nothing happened" attempts into a book of record. Instead, `Quote` lives in its own short-lived table: comparing quotes-created to payouts-referencing-that-quote gives the exact "people who previewed but never confirmed" metric, with no ledger contamination and no cleanup/expiry logic needed on the Payout resource itself.
-
-**Net design:** `POST /payouts` stays a single call for the core resource. `Quote` is an additive, optional, non-authoritative pre-step — used only where FX-rate sensitivity actually demands it, not as a default double-check gate on every payout.
+`Quote` lives in its own short-lived table — not in the payout ledger. Comparing quotes-created to payouts-referencing-that-quote gives abandonment metrics without polluting the financial ledger.
 
 ### 3.8 Security & observability
 
-- **mTLS** for partner-facing calls, **HMAC-signed payloads** for webhook deliveries so callers can verify authenticity.
-- **Correlation ID** generated at `POST /payouts` and threaded through every log line, Kafka event, and partner call for that payout.
-- Structured logs + metrics (payout latency, failure rate by rail, DLQ depth) as first-class outputs, not an afterthought.
+**Security:**
+- **mTLS** for all partner-facing rail calls — mutual authentication, not just server auth
+- **HMAC-SHA256 signed** webhook payloads — callers verify the `X-Boku-Signature` header before processing
+- **Secrets Manager** for partner API keys and mTLS certs — rotated without redeployment
+- **Correlation ID** generated at `POST /payouts`, threaded through every log line, Kafka event, and partner call for that payout's lifetime
 
-### 3.9 Idempotency — identifiers, storage, and why it's a systemic pattern, not one header
+**Observability:**
+The `payout_audit` table (§2 terminology, §3.3) is the foundation for all monitoring — per-step `duration_ms` rows power SLA dashboards and proactive alerting. See the **Traffic Model, SLA & Proactive Alerting** document for:
+- Per-step execution budgets (target / warning / critical thresholds)
+- 18 named alert definitions with top-5 prioritisation (☑ marks MVP alerts)
+- Audit table schema and SQL views
+- Dashboard definitions (Payout Health, Step Latency, State Distribution, Rail Health, Refund Tracker)
+- Ops runbook stubs
+
+### 3.9 Idempotency — identifiers, storage, and why it's a systemic pattern
 
 **Idempotency-Key and Correlation-ID answer different questions — don't collapse them.**
-The Idempotency-Key answers *"is this a duplicate request?"* — caller-supplied, and stable across every retry of one logical payout, including a rail failover. The Correlation-ID answers *"how do I trace this specific execution?"* — generated per attempt, and threaded through logs/Kafka events/spans for that attempt alone. If a payout retries or fails over from one rail to another, one Idempotency-Key should span the whole thing, but each attempt should get its own Correlation-ID — collapsing them into a single ID blurs two different attempts (possibly to two different partners) into one trace, which makes exactly the failure this design cares about harder to debug.
+- `Idempotency-Key` — caller-supplied, stable across every retry of one logical payout including rail failover. Answers: *"is this a duplicate request?"*
+- `Correlation-ID` — generated per attempt, threaded through logs/events/spans for that attempt alone. Answers: *"how do I trace this specific execution?"*
 
-**The Idempotency-Key doubles as the partner reference — that's what makes ambiguous-failure recovery possible.**
-On every outbound call to a disbursement partner, send the Idempotency-Key itself (or a partner-safe derivation of it, if their reference field has length/charset limits) as the `client_reference`. This is the exact mechanism DASH used with WU's MTCN reference. It matters specifically when a connection drops mid-call and the outcome is unknown: instead of guessing, query the partner's own status-lookup endpoint using that same reference — this is a targeted, on-demand use of the reconciliation logic in §3.6, triggered by an ambiguous failure instead of the scheduled sweep. This is exactly what the `SUBMITTED_UNCONFIRMED` state in §3.3 exists for, and — critically — **failover to a different rail must wait for that resolution.** Sending the same payout to Partner B while Partner A's outcome is still unknown is exactly how a system pays out twice.
+Collapsing them blurs two different attempts (possibly to two different partners) into one trace — making the exact failures this design handles hardest to debug.
 
-**Where the key lives: Postgres is the source of truth; Redis is a fast-path cache, never the reverse.**
-The Idempotency-Key needs a **unique constraint in the same transactional store as the payout ledger** (Postgres) — dedup-check and payout-creation have to happen in one ACID transaction, or two concurrent requests can both race past a separate check before either writes the payout. Redis alone isn't safe as the source of truth here: it's not durable by default, and an evicted or lost key would let a genuine retry sail through as a "new" payout — unacceptable for money movement. The right split (already reflected in §4's AWS mapping) is: Redis in front, for a sub-millisecond "have I seen this key" check under high submission volume; Postgres behind it as the actual guarantee. If Redis misses or is empty, the request falls through to Postgres, whose unique constraint catches it — and on a constraint violation, look up and return the existing record rather than erroring the caller.
+**The Idempotency-Key doubles as the partner reference.**
+On every outbound rail call, send the Idempotency-Key (or a partner-safe derivation if their reference field has length/charset limits) as the `client_reference`. This is what makes `SUBMITTED_UNCONFIRMED` recovery possible: query the partner's own status endpoint using that reference — targeted, on-demand reconciliation triggered by an ambiguous failure, not the scheduled sweep. And critically: **failover to a different rail must wait for that resolution.** Sending to Partner B while Partner A's outcome is still unknown is exactly how a system pays out twice.
 
-**Idempotency is a property of the whole microservices architecture, not a header on one endpoint.**
-The stack here is event-driven (Kafka) with multiple services (submission, state-machine worker, reconciliation, partner integration) — and duplicate delivery can happen at every hop, not just the public API:
-- **Ingress** (caller → API): the `Idempotency-Key` header, as above.
-- **Internal** (service → service, via Kafka): at-least-once delivery means the state-machine worker *will* see the same event twice eventually. This is already handled, just not previously named as idempotency — the single-writer guard (`UPDATE ... WHERE status = 'PENDING'`) from §3.3 is what makes a duplicate event a no-op instead of a double transition.
-- **Egress** (service → partner): the partner reference, above.
+**This also covers the API Gateway timeout scenario.**
+If the gateway times out before the `202` reaches the caller, the caller retries with the same key. If the payout was already created, the dedup check returns the original response. If not, it creates it now. The caller can't tell the difference — that's the design.
 
-Three layers, three mechanisms, one principle — worth stating explicitly in the walkthrough rather than letting it look like idempotency is just something `POST /payouts` does.
+**Storage: Postgres is the source of truth; Redis is a fast-path cache.**
+The Idempotency-Key needs a uniqueness constraint in the same transactional store as the payout ledger — dedup check and payout INSERT must happen in one ACID transaction. Redis provides sub-millisecond fast-path under high volume; if Redis misses, the request falls through to Postgres. On a uniqueness violation, return the existing record — don't error the caller.
+
+**Idempotency is a property of the whole microservices architecture, not one header.**
+- **Ingress** (caller → API): `Idempotency-Key` header + Postgres unique constraint
+- **Internal** (service → service via Kafka): at-least-once delivery means workers *will* see the same event twice. The single-writer guard (`UPDATE ... WHERE status = 'X'`) makes a duplicate event a no-op instead of a double transition
+- **Egress** (service → partner): `client_reference` = Idempotency-Key on every outbound call
+
+Three layers, three mechanisms, one principle.
 
 ---
 
-## 4. Apply for AWS Cloud (example)
+## 4. AWS Mapping
 
 | Component | AWS Service | Why |
 |---|---|---|
-| Public API entry | **API Gateway** | Request validation, auth, rate limiting before traffic reaches compute — same pattern used for FX rate caching at DASH. |
-| Payout services | **EKS** | Spring Boot services as containerized microservices — submission, state-machine worker, reconciliation, webhook-dispatcher as separate deployables. |
-| Event backbone | **MSK (managed Kafka)** | Payout-created / status-changed events fan out to reconciliation, webhook dispatch, analytics without tight coupling. |
-| System of record | **RDS PostgreSQL** | ACID guarantees for money movement; idempotency-key table and payout ledger need real transactions, not eventual consistency. |
-| Retry / DLQ | **SQS + DLQ** | Per-rail retry queues with backoff; exhausted messages land in a dead-letter queue for follow-up, exactly like DASH's callback DLQ. |
-| Idempotency fast-path | **ElastiCache (Redis)** | Sub-millisecond duplicate-key check before hitting Postgres, under high submission volume — a cache in front of the source of truth, not a replacement for it (see §3.9). |
-| Scheduled reconciliation | **Lambda + EventBridge Scheduler** | Periodic batch job matching partner reports to internal records — same shape as DASH's Lambda-based reconciliation. |
-| Partner credentials / certs | **Secrets Manager** | mTLS certs and partner API keys rotated without redeploying services. |
-| Observability | **CloudWatch + X-Ray** | Structured logs, per-rail failure metrics, distributed traces keyed on the correlation ID. |
-| Webhook delivery | **SNS/SQS fan-out + Lambda dispatcher** | Decouples "status changed" from "call every subscriber," with the same retry/backoff/DLQ pattern as partner calls. |
+| Public API entry | **API Gateway** | Request validation, auth, rate limiting before traffic reaches compute |
+| Payout services | **EKS** | Six Spring Boot microservices as separate deployables: Payout Service, Compliance Service, Fund Pull Worker, Disbursement Worker, Refund Worker, Webhook Dispatcher |
+| Event backbone | **MSK (managed Kafka)** | 6 topics (see observability doc §1.3); durable, ordered, replayable event log for all state transitions |
+| System of record | **RDS PostgreSQL** | ACID guarantees for payout ledger + payout_audit + idempotency-key table — all three need real transactions |
+| Retry / DLQ | **SQS + DLQ** | Per-rail and per-worker retry queues with backoff; exhausted messages land in DLQ for follow-up |
+| Idempotency fast-path | **ElastiCache (Redis)** | Sub-millisecond duplicate-key check before hitting Postgres — cache in front of the source of truth, never a replacement |
+| Compliance provider | **External API (via EKS)** | Fraud engine + AML/sanctions scanner called from Compliance Service; credentials in Secrets Manager |
+| Scheduled reconciliation | **Lambda + EventBridge Scheduler** | Periodic batch job matching partner reports against `payout_audit` — same shape as DASH's Lambda-based reconciliation |
+| Partner credentials / certs | **Secrets Manager** | mTLS certs and partner API keys rotated without redeploying services |
+| Observability | **CloudWatch + X-Ray** | Structured logs, per-step duration metrics from `payout_audit`, distributed traces keyed on Correlation ID |
+| Webhook delivery | **SNS/SQS fan-out + Lambda dispatcher** | Decouples "status changed" from "call every subscriber"; same retry/backoff/DLQ pattern as partner calls |
 
-This assumes a blank-slate AWS environment, consistent with Boku's greenfield Banking & Settlement build — no legacy infra to work around.
+Assumes a blank-slate AWS environment, consistent with Boku's greenfield Banking & Settlement build.
 
 ---
 
-## 5. Tech Stack Selection
+## 5. Tech Stack
 
 | Layer | Choice | Why |
 |---|---|---|
-| Language / framework | **Java 21 + Spring Boot** | Matches Boku's stated stack; Spring Boot's blocking model is fine for the API layer, but I'd evaluate **WebFlux** for the partner-calling layer specifically — high fan-out to multiple slow rails is exactly the non-blocking use case it's built for. |
-| Internal service calls | **gRPC + Protocol Buffers** | Boku's JD lists gRPC as primary internal protocol; typed contracts and lower latency matter for the submission → state-machine-worker → reconciliation call chain. |
-| External API | **REST/JSON** | Public-facing payout API — broadest caller compatibility, easiest for merchant integrators to consume without a protobuf toolchain. |
-| Event streaming | **Kafka (MSK)** | Durable, ordered, replayable — required for an auditable money-movement event log, not just a message bus. |
-| Primary datastore | **PostgreSQL** | Transactional guarantees for the ledger and state machine; same engine I've already tuned at scale (9.6M-row table, HOT/autovacuum). |
-| Cache / fast dedup | **Redis** | Idempotency-key lookups and rate limiting need sub-ms latency. |
-| IaC | **Terraform** | Reproducible, greenfield infra from a blank AWS account. |
-| CI/CD | **GitHub Actions** (or equivalent) | Already used across my own projects; straightforward fit for EKS deploys. |
+| Language / framework | **Java 21 + Spring Boot** | Matches Boku's stated stack. Blocking model is fine for the Payout Service API layer; evaluate **WebFlux** for Disbursement Worker and Fund Pull Worker — high fan-out to slow external rails is exactly the non-blocking use case it's built for. |
+| Internal service calls | **gRPC + Protocol Buffers** | Boku's JD lists gRPC as primary internal protocol; typed contracts and lower latency matter for the worker-to-worker call chain. |
+| External API | **REST/JSON** | Public-facing payout API — broadest caller compatibility, no protobuf toolchain required for merchant integrators. |
+| Event streaming | **Kafka (MSK)** | Durable, ordered, replayable — required for an auditable money-movement event log. Not just a message bus. |
+| Primary datastore | **PostgreSQL** | ACID guarantees for ledger, state machine, and idempotency; same engine tuned at scale (9.6M-row table, HOT/autovacuum at DASH). |
+| Cache / fast dedup | **Redis** | Idempotency-key fast-path and rate limiting need sub-ms latency. |
+| IaC | **Terraform** | Reproducible greenfield infra from a blank AWS account. |
+| CI/CD | **GitHub Actions** | Straightforward fit for EKS deploys; already used across own projects. |
 
 ---
 
 ## 6. Stakeholder Coverage
 
-A design that only satisfies the API contract misses half of what's actually being evaluated for a Senior/Architect role — the honest version of this section names what's covered, and what isn't, rather than claiming full coverage that hasn't actually been designed.
-
-| Role | What they need from this design | Covered already | Gap |
+| Role | What they need | Covered | Gap |
 |---|---|---|---|
-| **Customer** (the merchant/platform calling the API) | Predictable behavior, no duplicate charges, clear status visibility, fast failure diagnosis | Idempotency-Key (§3.4/§3.9), dual pull+push status tracking (§3.5), structured `error_code`/`failure_reason` | No stated SLA (max time in `PENDING`/`SUBMITTED_UNCONFIRMED` before it's treated as stuck), no rate-limit contract, no API versioning policy for breaking changes |
-| **PO** | Clear scope boundaries, MVP vs. later, ability to justify choices to the business | Quote and batch are explicitly "additive, not foundational" (§1); the approval gate is a policy flag, not a hard requirement (Decision D4) — phased-rollout thinking, not a single monolithic scope | No explicit Phase 1 / Phase 2 scope line, no success metrics tied to product outcomes (payout success rate, time-to-settle), no cost-per-rail tradeoff to inform prioritization |
-| **Developer** | Reasoned state model, testable contracts, low ambiguity at edges | Explicit state machine (§3.3), correlation-id vs. idempotency-key split (§3.9), consistent error shape | No test strategy named (contract tests, chaos-testing rail failures), no API versioning scheme, no client SDK story for the two protocols in play (REST external, gRPC internal) |
-| **DevOps** | Deployability, observability, scaling, secrets handling | Full AWS mapping (§4): EKS, MSK, RDS, SQS+DLQ, Secrets Manager, CloudWatch+X-Ray | No deployment strategy (canary/blue-green), no autoscaling policy for EKS under submission bursts, IaC named (Terraform) but not detailed |
-| **Operation Team** | Investigate a specific stuck payout, manual intervention, alerting thresholds | `SUBMITTED_UNCONFIRMED` exists exactly for stuck cases (§3.3), DLQ for exhausted retries, reconciliation loop (§3.6) | No ops-facing surface at all — no admin API/dashboard, no manual override/force-resolve endpoint, no defined alert threshold (e.g. page if `SUBMITTED_UNCONFIRMED` > 15 min), no runbook |
-| **Financial team** | Immutable audit trail, reconciliation accuracy, dispute resolution, regulatory reporting | Ledger entries are immutable/append-only (§2), reconciliation matches internal ledger vs. partner records (§3.6) | No GL/accounting-system integration point named, no stated audit-log retention policy, no explicit handling of how a `RETURNED` payout reconciles back into finance's books |
-| **Stakeholder** (exec/business) | Risk, cost, time-to-market, scalability story | Greenfield rationale, AWS choices justified against DASH-proven patterns at real scale | No TCO/cost estimate, no phased timeline, no risk register for the Payouts API itself |
+| **Customer** (merchant/platform) | Predictable behaviour, no duplicate charges, clear status visibility, fast failure diagnosis | Idempotency-Key (§3.4/§3.9), dual pull+push tracking (§3.5), structured `error_code`/`failure_reason`, full history in `GET /payouts/{id}` | No stated SLA on max time in `PENDING_COMPLIANCE` / `SUBMITTED_UNCONFIRMED`; no rate-limit contract; no API versioning policy |
+| **PO** | Clear scope, MVP vs. later, business justification | Quote + batch explicitly "additive, not foundational"; Pull-and-Pay vs. prefunded named as a live question; compliance gate as optional per-corridor | No Phase 1 / Phase 2 scope line; no success metrics (payout success rate, time-to-settle); no cost-per-rail tradeoff |
+| **Developer** | Reasoned state model, testable contracts, low ambiguity | Full state machine (§3.3), Correlation-ID vs. Idempotency-Key split (§3.9), consistent error shape, audit table schema | No test strategy (contract tests, chaos rail failures); no API versioning scheme; no client SDK story for REST + gRPC |
+| **DevOps** | Deployability, observability, scaling, secrets | Full AWS mapping (§4): 6 EKS microservices, MSK, RDS, SQS+DLQ, Secrets Manager, CloudWatch+X-Ray | No canary/blue-green deployment strategy; no EKS autoscaling policy for submission bursts; Terraform named but not detailed |
+| **Operation Team** | Investigate stuck payouts, manual intervention, alerting | `SUBMITTED_UNCONFIRMED` + `REFUND_PENDING` age alerts (☑ in observability doc), `payout_audit` for per-step trace, DLQ for exhausted retries | No admin API/dashboard; no manual override/force-resolve endpoint; runbooks are stubs — data supports them but procedures not yet written |
+| **Financial team** | Immutable audit trail, reconciliation accuracy, dispute resolution | `payout_audit` is append-only (§3.3); reconciliation matches internal ledger vs. partner records (§3.6); `REFUNDED` trail: pull → failed → refunded | No GL/accounting-system integration point; no audit-log retention policy; no explicit handling of how `RETURNED` reconciles back into finance's books |
+| **Stakeholder** (exec/business) | Risk, cost, time-to-market, scalability story | Greenfield rationale; AWS choices justified against DASH-proven patterns at real scale | No TCO/cost estimate; no phased timeline; no risk register |
 
-**The honest read:** the design is strongest on Customer / Developer / DevOps, because those map directly onto what's already proven at DASH. **Operation Team and Financial team are the thinnest** — the underlying data already supports both (the ledger, `SUBMITTED_UNCONFIRMED`, reconciliation), but there's no explicit ops-facing tooling or finance-integration story naming how those roles actually use it day to day. Naming that gap live is a stronger answer than claiming coverage that isn't there.
+**The honest read:** strongest on Customer / Developer / DevOps — these map directly onto DASH-proven patterns. Operation Team coverage improved materially with the observability doc (audit table, alert thresholds, dashboard definitions), but the runbooks are still stubs. Financial team and Stakeholder remain the thinnest. Naming these gaps unprompted is a stronger answer than overclaiming coverage.
 
 ---
 
 ## Notes for the live walkthrough
 
-- Lead with Assumption 2 (single vs. batch) early — it's the one most likely to get pushback/questions, and I want to show I've already weighed the alternative rather than have it "discovered" mid-walkthrough.
-- Ask both rail-model open questions (§1) **before** diving into failure handling — the answers directly scope how much of §3.9 applies:
-  - If caller-selects-rail: the rail-selection layer disappears entirely, failover-blocking in §3.9 goes away, `SUBMITTED_UNCONFIRMED` stays.
-  - If platform-picks-rail with priority-ordered fallback: §3.9 applies in full.
-  - If platform-picks-rail with true multi-rail scoring: need to add a selection/scoring step not currently designed.
-  - Framing it this way shows the design is load-bearing on a real unknown, not a gap — it's a live conversation, not a mistake to defend.
-- If asked to go deeper on any one area, reconciliation, the state machine, and the idempotency/correlation-id split (§3.9) are the strongest — direct extensions of the Dash Remittance work.
-- Ask the funding model question (Assumption 4) early — it changes `POST /payouts` materially:
-  - Prefunded wallet → `POST /payouts` can reject synchronously with `INSUFFICIENT_FUNDS`; needs a wallet resource
-  - Atomic pull-and-pay → one API call, two failure surfaces; pull failure means nothing moves; simpler for caller, harder to reason about failures
-- Be ready to admit: this design does not attempt to cover **treasury/cash-position** concerns (marked desirable in the JD, not required) — scope it out explicitly if asked, rather than improvising.
-- If asked "who else does this touch beyond the API caller?" — go straight to §6. Naming the Operation Team / Financial team gaps unprompted lands better than waiting to be caught out on them.
+- **Lead with the Pull-and-Pay + compliance gate design** — it demonstrates the full complexity of a real payments platform: async compliance, explicit fund pull state, conditional refund flow, and the key insight that separating `FUND_PULLING` from `SUBMITTED` eliminates an entire class of flag-check bugs. This is the showcase, not the simple path.
+- **Ask Q3 (funding model) early** — if Boku uses prefunded wallet, the design simplifies significantly. Show you know both, let them confirm, then pivot. Don't defend Pull-and-Pay unconditionally.
+- **Ask Q1 + Q2 (rail model) before failure handling** — the answers scope how much of §3.9 applies. Framing it as a live question shows the design is load-bearing on a real unknown, not a gap.
+- **Ask Q2 (rail model) before failure handling** — the answers scope how much of §3.9 applies:
+  - Caller-selects-rail → rail selection layer gone, failover-blocking in §3.9 gone, `SUBMITTED_UNCONFIRMED` stays
+  - Priority-ordered fallback → §3.9 applies in full
+  - True multi-rail scoring → need a selection/scoring step not currently designed
+- **The state machine diagram is the anchor** — walk through it first, then the compliance gate, then idempotency. Everything else is a detail of one of those three.
+- **Strongest deep-dive areas:** the idempotency/Correlation-ID split (§3.9), the `SUBMITTED_UNCONFIRMED` ambiguous-failure handling, and the audit table as the foundation for all observability — all direct extensions of the DASH Remittance work.
+- **Proactively surface Operation Team and Financial team gaps** (§6) — naming them first lands better than waiting to be caught out.
+- **Be ready to scope out treasury/cash-position** — marked desirable in the JD, not required. Scope it out explicitly if asked.
+- **`REFUND_FAILED` is the zero-tolerance state** — the only alert with no acknowledgement window. Worth naming explicitly to show you understand the difference between "important" and "critical."

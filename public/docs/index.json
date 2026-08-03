@@ -7,6 +7,12 @@
       "path": "docs/payouts-api-design.md"
     },
     {
+      "id": "observability",
+      "title": "Traffic Model, SLA & Proactive Alerting",
+      "type": "markdown",
+      "path": "docs/observability.md"
+    },
+    {
       "label": "Diagrams",
       "children": [
         {
