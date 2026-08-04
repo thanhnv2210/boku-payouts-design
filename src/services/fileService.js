@@ -25,7 +25,7 @@ export function findDocById(nodes, id) {
     if (node.children) {
       const found = findDocById(node.children, id)
       if (found) return found
-    } else if (node.id === id) {
+    } else if (node.id === id && node.type !== 'link') {
       return node
     }
   }

@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/((?!docs/|fonts/|api-docs/).*)", "destination": "/index.html" }
+    { "source": "/((?!docs/|fonts/|api-docs/|slides/).*)", "destination": "/index.html" }
   ]
 }

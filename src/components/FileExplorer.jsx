@@ -14,6 +14,16 @@ function TreeNode({ node, depth, selected, onSelect }) {
     )
   }
 
+  if (node.type === 'link') {
+    return (
+      <li className="tree-doc" style={{ paddingLeft: `${depth * 12 + 4}px` }}>
+        <a className="tree-doc-title tree-doc-link" href={node.href} target="_blank" rel="noopener noreferrer">
+          {node.title}
+        </a>
+      </li>
+    )
+  }
+
   return (
     <li
       className={`tree-doc ${selected?.id === node.id ? 'active' : ''}`}

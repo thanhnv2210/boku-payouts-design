@@ -6,6 +6,12 @@
       "type": "simulation"
     },
     {
+      "id": "slides",
+      "title": "Interview Slides ↗",
+      "type": "link",
+      "href": "/slides/"
+    },
+    {
       "id": "payouts-api-design",
       "title": "Payouts API — Design Decision Record",
       "type": "markdown",

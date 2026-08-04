@@ -32,6 +32,7 @@ export default defineConfig({
     react(),
     serveStaticHtml([
       { prefix: '/api-docs/', file: 'public/api-docs/index.html' },
+      { prefix: '/slides/',   file: 'public/slides/index.html' },
     ]),
   ],
   cacheDir: '.vite-cache',

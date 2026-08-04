@@ -193,6 +193,11 @@ button { font-family: inherit; cursor: pointer; }
 }
 .file-explorer .tree-doc:hover { background: var(--accent-tint); color: var(--ink); }
 .file-explorer .tree-doc.active { background: var(--accent-tint); color: var(--accent-strong); font-weight: 600; }
+.file-explorer .tree-doc-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
 
 /* ---------- Rail tools ---------- */
 .rail-tools {
