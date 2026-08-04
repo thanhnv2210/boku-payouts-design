@@ -1,6 +1,11 @@
 {
   "tree": [
     {
+      "id": "simulation",
+      "title": "Flow Simulation",
+      "type": "simulation"
+    },
+    {
       "id": "payouts-api-design",
       "title": "Payouts API — Design Decision Record",
       "type": "markdown",
