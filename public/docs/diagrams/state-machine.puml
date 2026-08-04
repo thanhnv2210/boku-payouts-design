@@ -17,6 +17,7 @@ state "PENDING_MANUAL_REVIEW" as PMR #fff3e0
 state "FUND_PULLING" as FP #fff3e0
 state "SUBMITTED" as SUBMITTED
 state "SUBMITTED_UNCONFIRMED" as UNCONF #f3e8d2
+state "REFUND_REQUIRED" as RR #ffe8cc
 state "REFUND_PENDING" as RP #fff3e0
 state "SETTLED" as SETTLED #e4efe6         : Terminal
 state "FUND_PULL_FAILED" as FPF #f1dcd6    : Terminal
@@ -82,14 +83,30 @@ end note
 
 ' Refund path — Pull-and-Pay only
 ' Every FAILED/RETURNED from SUBMITTED means funds were pulled (FUND_PULLING passed)
-FAILED   --> RP : Pull-and-Pay:\nfunds already with Boku
-RETURNED --> RP : Pull-and-Pay:\nrail reversed after pull
-UNCONF   --> RP : Pull-and-Pay:\nlookup resolves failed
+' Option A — immediate event-driven refund
+FAILED   --> RP : [immediate]\nPull-and-Pay:\nevent-driven refund
+RETURNED --> RP : [immediate]\nPull-and-Pay:\nevent-driven refund
+UNCONF   --> RP : [immediate]\nlookup resolves failed
+
+' Option B — batch job via REFUND_REQUIRED (dashed = optional design)
+FAILED   ..> RR : [batch]\nPull-and-Pay:\nflag for batch job
+RETURNED ..> RR : [batch]\nPull-and-Pay:\nflag for batch job
+UNCONF   ..> RR : [batch]\nlookup resolves failed
+RR       ..> RP : Refund Batch Job\npicks up record\n(SELECT FOR UPDATE\nSKIP LOCKED)
+
+note right of RR
+  Optional intermediate state.
+  Trade-off: user satisfaction
+  (immediate) vs system safety
+  (batch — rate-controlled,
+  observable, safe under burst).
+  Dashed lines = batch path.
+end note
 
 note right of RP
   Pull-and-Pay only.
   If SUBMITTED was reached,
-  funds_pulled is always true —
+  funds are always with Boku —
   no flag check needed.
   Prefunded wallet: internal
   credit, no new state.
