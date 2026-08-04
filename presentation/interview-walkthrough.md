@@ -115,6 +115,40 @@ style: |
     font-size: 1em;
     margin-top: 8px;
   }
+  section.dense {
+    font-size: 13px;
+    padding: 32px 48px;
+  }
+  section.dense h1 {
+    font-size: 1.6em;
+    padding-bottom: 8px;
+    margin-bottom: 12px;
+  }
+  section.dense pre {
+    font-size: 0.7em;
+    padding: 10px 12px;
+    line-height: 1.4;
+  }
+  section.dense table {
+    font-size: 0.8em;
+  }
+  section.dense th, section.dense td {
+    padding: 5px 10px;
+  }
+  section.dense ul {
+    line-height: 1.5;
+  }
+  section.dense li {
+    margin-bottom: 2px;
+  }
+  section.dense blockquote {
+    padding: 8px 12px;
+    margin: 8px 0;
+    font-size: 0.9em;
+  }
+  section.dense p {
+    margin: 6px 0;
+  }
 ---
 
 <!-- _class: title -->
@@ -217,6 +251,8 @@ GET /payouts/{id}      →   { status: SETTLED, history: [...] }
 `DELETE /payouts/{id}` is absent — funds-movement records are never deleted, only transitioned to terminal states.
 
 ---
+
+<!-- _class: dense -->
 
 # Payout State Machine
 
@@ -325,6 +361,8 @@ After: reaching `SUBMITTED` *is* the guarantee. Refund worker does exactly one t
 
 ---
 
+<!-- _class: dense -->
+
 # Refund Design — `REFUND_REQUIRED` + Batch Job
 
 **Updated state machine for refunds:**
@@ -357,6 +395,8 @@ FOR UPDATE SKIP LOCKED;
 > If merchant SLA requires sub-minute refund initiation, use event-driven but add a **rate limiter (token bucket per rail)** so a failure burst doesn't amplify into a refund rail storm.
 
 ---
+
+<!-- _class: dense -->
 
 # Cancellation — Boundary at the First External Call
 
