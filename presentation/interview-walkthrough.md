@@ -325,6 +325,39 @@ After: reaching `SUBMITTED` *is* the guarantee. Refund worker does exactly one t
 
 ---
 
+# Refund Design — `REFUND_REQUIRED` + Batch Job
+
+**Updated state machine for refunds:**
+```
+FAILED / RETURNED → REFUND_REQUIRED → REFUND_PENDING → REFUNDED | REFUND_FAILED
+                         ↑                   ↑
+                  Disbursement Worker    Refund Batch Job
+                  writes immediately     picks up on schedule
+```
+
+**The trade-off — User Satisfaction vs System Performance:**
+
+| Dimension | Immediate (event-driven) | Batch Job via `REFUND_REQUIRED` (chosen) |
+|---|---|---|
+| **User satisfaction** | Faster refund — merchant gets money back sooner | Delay of up to one batch interval (e.g. 5 min) |
+| **System risk** | Burst of failures = burst of refund rail calls | Controlled rate — batch job throttles calls |
+| **Observability** | State scattered across Kafka consumer metrics | `SELECT WHERE status='REFUND_REQUIRED'` — everything visible |
+| **Failure recovery** | Kafka DLQ — harder to inspect and replay | DB rows are durable, queryable, trivially reprocessable |
+| **Concurrency** | Consumer race on same payout | `SELECT FOR UPDATE SKIP LOCKED` — safe, no double-execution |
+
+**Safe batch pickup:**
+```sql
+SELECT payout_id, version FROM payouts
+WHERE  status = 'REFUND_REQUIRED' ORDER BY updated_at ASC LIMIT 100
+FOR UPDATE SKIP LOCKED;
+-- advance to REFUND_PENDING before the rail call
+-- crash leaves rows in REFUND_PENDING, not silently stuck
+```
+
+> If merchant SLA requires sub-minute refund initiation, use event-driven but add a **rate limiter (token bucket per rail)** so a failure burst doesn't amplify into a refund rail storm.
+
+---
+
 # Cancellation — Boundary at the First External Call
 
 **Rule:** `POST /payouts/{id}/cancel` is only permitted **before any external API call has been made**.

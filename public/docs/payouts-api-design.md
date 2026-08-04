@@ -87,8 +87,9 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 | **`FUND_PULLING`** | Non-terminal (Pull-and-Pay): debiting caller's account. Separating this from `SUBMITTED` means reaching `SUBMITTED` guarantees funds are with Boku — no flag check needed anywhere. |
 | **`FUND_PULL_FAILED`** | Terminal: caller's account debit failed (insufficient funds, mandate revoked). No funds moved — no refund required. |
 | **`SUBMITTED_UNCONFIRMED`** | Non-terminal: connection to partner rail dropped mid-call — outcome unknown. Must resolve via partner-reference lookup before any failover or refund decision. |
-| **`REFUND_PENDING`** | Non-terminal (Pull-and-Pay): disbursement failed after `SUBMITTED` — Boku holds caller's money, refund in progress. |
-| **`REFUNDED`** | Terminal: caller's funds successfully returned. Audit trail: pull → failed → refunded. |
+| **`REFUND_REQUIRED`** | Non-terminal (Pull-and-Pay): disbursement failed after `SUBMITTED` — flagged for refund. Boku holds caller's money. Picked up by the scheduled Refund Batch Job. Separating this from `REFUND_PENDING` decouples failure detection from execution — see §3.11 trade-off. |
+| **`REFUND_PENDING`** | Non-terminal (Pull-and-Pay): Refund Batch Job has picked up the record and called the payment rail to push funds back. Refund is in-flight. |
+| **`REFUNDED`** | Terminal: caller's funds successfully returned. Audit trail: pull → failed → refund_required → refund_pending → refunded. |
 | **`REFUND_FAILED`** | Terminal: refund also failed. Money with Boku — neither beneficiary nor caller holds it. Page oncall immediately. |
 
 ---
@@ -207,10 +208,11 @@ SUBMITTED → RETURNED                                                  (rail ac
 SUBMITTED → SUBMITTED_UNCONFIRMED                                     (connection dropped — outcome unknown)
 SUBMITTED_UNCONFIRMED → SETTLED | FAILED                              (partner-reference lookup only — never guessed)
 
-FAILED   → REFUND_PENDING                                             (SUBMITTED reached = funds always with Boku)
-RETURNED → REFUND_PENDING                                             (rail reversed after pull)
-REFUND_PENDING → REFUNDED                                             (refund to caller succeeds — terminal)
-REFUND_PENDING → REFUND_FAILED                                        (refund fails — terminal, manual intervention)
+FAILED   → REFUND_REQUIRED                                            (SUBMITTED reached = funds always with Boku — flagged for batch refund)
+RETURNED → REFUND_REQUIRED                                            (rail reversed after pull — flagged for batch refund)
+REFUND_REQUIRED → REFUND_PENDING                                      (Refund Batch Job picks up the record, calls payment rail)
+REFUND_PENDING  → REFUNDED                                            (refund to caller succeeds — terminal)
+REFUND_PENDING  → REFUND_FAILED                                       (refund fails — terminal, manual intervention)
 
 PENDING → CANCELLED                                                   (caller cancels before submission — terminal)
 ```
@@ -233,9 +235,9 @@ Runs after `202 Accepted`, before any funds move. Two checks in sequence:
 |---|---|---|
 | `REJECTED_COMPLIANCE` | No | Compliance runs before any funds move |
 | `FUND_PULL_FAILED` | No | Caller's account was never debited |
-| `FAILED` (from `SUBMITTED`) | Yes — always | `SUBMITTED` means funds are with Boku |
-| `RETURNED` (from `SUBMITTED`) | Yes — always | Rail reversed after Boku already held funds |
-| `SUBMITTED_UNCONFIRMED → FAILED` | Yes — after lookup resolves | Do not refund while outcome is unknown |
+| `FAILED` (from `SUBMITTED`) | Yes — flags `REFUND_REQUIRED` | `SUBMITTED` means funds are with Boku; batch job executes |
+| `RETURNED` (from `SUBMITTED`) | Yes — flags `REFUND_REQUIRED` | Rail reversed after Boku held funds; batch job executes |
+| `SUBMITTED_UNCONFIRMED → FAILED` | Yes — after lookup resolves | Do not flag `REFUND_REQUIRED` while outcome is unknown |
 
 `REFUND_FAILED` is the most serious ops state — money is with Boku, held by neither party. Must page oncall immediately with no acknowledgement window. See the **Traffic Model, SLA & Proactive Alerting** doc for full alert definitions.
 
@@ -410,6 +412,50 @@ WHERE  payout_id = ?
 ```
 
 The optimistic lock matters here too: a cancel request and a compliance-pass event can race. The `version` check ensures only one wins — if the compliance worker advanced the payout to `FUND_PULLING` between the cancel handler's read and write, `rows_affected = 0` and the cancel handler re-reads `FUND_PULLING` and returns `422`.
+
+### 3.11 Trade-off — `REFUND_REQUIRED` + Batch Job vs. Immediate Refund Execution
+
+**The design choice:** when a payout fails after `SUBMITTED`, the Disbursement Worker writes `REFUND_REQUIRED` and stops. A scheduled **Refund Batch Job** (e.g. every 5 minutes, or configurable per corridor) picks up all `REFUND_REQUIRED` records and executes the refund — advancing each to `REFUND_PENDING` → `REFUNDED` | `REFUND_FAILED`.
+
+**Why not trigger the refund immediately (event-driven)?**
+
+An immediate, event-driven refund feels like the obvious choice — a Kafka consumer reacts to `payout.failed` and calls the payment rail right away. But it introduces risks under load:
+
+- A burst of failures (rail outage, batch of invalid accounts) fires a corresponding burst of refund rail calls simultaneously — amplifying load on the same rail that may already be struggling
+- No rate control: if 1,000 payouts fail in 30 seconds, 1,000 refund calls go out in the same window
+- A partial system failure (Refund Worker crashes mid-burst) leaves some payouts flagged and some not, with no clean retry boundary
+
+The `REFUND_REQUIRED` state is a **durable queue in the database**. The batch job reads it under controlled conditions — with rate limiting, retry logic, and a single observable query that shows exactly what is waiting and for how long.
+
+**Trade-off table:**
+
+| Dimension | Immediate (event-driven) | Batch Job via `REFUND_REQUIRED` |
+|---|---|---|
+| **User satisfaction** | Faster refund — merchant sees funds returned sooner | Delay of up to one batch interval (e.g. 5min) before refund starts |
+| **System risk** | Burst of failures = burst of refund calls — may overwhelm rail | Controlled rate — batch job throttles outbound calls |
+| **Failure recovery** | Kafka DLQ for failed events — harder to inspect and replay | `REFUND_REQUIRED` rows are visible, queryable, and trivially reprocessable |
+| **Observability** | Refund state scattered across Kafka consumer metrics | Single SQL query on `status = 'REFUND_REQUIRED'` shows everything waiting |
+| **Concurrency risk** | Multiple consumer instances can race on the same payout | Batch job uses `SELECT ... FOR UPDATE SKIP LOCKED` — safe fan-out with no double-execution |
+| **Operational control** | No easy way to pause, drain, or rate-limit refunds | Batch job schedule and batch size are tunable without code change |
+
+**Implementation — safe batch pickup with `SKIP LOCKED`:**
+
+```sql
+-- Batch job: claim a batch of REFUND_REQUIRED records safely
+SELECT payout_id, version
+FROM   payouts
+WHERE  status = 'REFUND_REQUIRED'
+ORDER  BY updated_at ASC          -- oldest first
+LIMIT  100
+FOR UPDATE SKIP LOCKED;           -- other batch job instances skip rows already claimed
+```
+
+Each claimed row is immediately advanced to `REFUND_PENDING` (with optimistic lock on `version`) before the refund call is made — so a job crash leaves records in `REFUND_PENDING`, not silently stuck in `REFUND_REQUIRED`.
+
+**The `REFUND_REQUIRED_AGE` alert** (companion to the existing `REFUND_PENDING_AGE` alert in the observability doc) should fire if any `REFUND_REQUIRED` row is older than the expected batch interval + buffer — indicating the batch job has stalled.
+
+**When to prefer immediate refund instead:**
+If merchant SLA requires sub-minute refund initiation (e.g. consumer-facing corridors with regulatory mandates on reversal time), the batch interval is too slow. In that case, use the event-driven path but add an explicit rate-limiter (token bucket per rail) and a circuit breaker so a failure burst does not amplify into a refund rail storm.
 
 ---
 
