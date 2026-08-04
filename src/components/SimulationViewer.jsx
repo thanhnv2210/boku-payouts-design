@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { SCENARIOS, STATUS_KIND } from '../data/scenarios'
+import MerchantPhone from './MerchantPhone'
 
 const WORKER_LABELS = {
   'api':                 'API Gateway',
@@ -52,8 +53,9 @@ export default function SimulationViewer() {
 
     scenario.steps.forEach((step, index) => {
       elapsed += step.delayMs
+      const stepElapsed = elapsed   // capture before closure — elapsed will keep mutating
       const t = setTimeout(() => {
-        const now = new Date(startTime + elapsed).toISOString().replace('T', ' ').slice(0, 23)
+        const now = new Date(startTime + stepElapsed).toISOString().replace('T', ' ').slice(0, 23)
         setCurrentStep(index)
         setAuditRows(prev => {
           const fromStatus = index === 0 ? null : scenario.steps[index - 1].status
@@ -126,6 +128,10 @@ export default function SimulationViewer() {
         )}
       </div>
 
+      {/* Side-by-side layout: internal view (left) + merchant phone (right) */}
+      <div className="sim-layout">
+      <div className="sim-left">
+
       {/* State pipeline */}
       <div className="sim-pipeline">
         {scenario.steps.map((step, i) => {
@@ -196,6 +202,11 @@ export default function SimulationViewer() {
           Terminal state reached: <strong>{scenario.steps[scenario.steps.length - 1].status}</strong>
         </div>
       )}
+
+      </div>{/* /sim-left */}
+
+      <MerchantPhone scenario={scenario} currentStep={currentStep} done={done} auditRows={auditRows} />
+      </div>{/* /sim-layout */}
     </div>
   )
 }
