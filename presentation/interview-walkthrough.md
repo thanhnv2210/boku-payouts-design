@@ -241,7 +241,20 @@ RETURNED → REFUND_PENDING → REFUNDED | REFUND_FAILED
 PENDING → CANCELLED
 ```
 
-**Key insight:** every transition is guarded by `UPDATE ... WHERE status = 'X'` — a duplicate Kafka event is a no-op, not a double transition.
+**Two-layer write guard — not just one:**
+
+`UPDATE ... WHERE status = 'X'` handles duplicate Kafka events on the same worker. But it doesn't cover **two independent writer types** reading the same row simultaneously before either commits — e.g. a partner callback + midnight batch reconciliation both seeing `SUBMITTED` and both writing `SETTLED`.
+
+**Optimistic locking with a `version` column closes this gap:**
+```sql
+UPDATE payouts
+SET status = 'SETTLED', version = version + 1
+WHERE payout_id = ? AND status = 'SUBMITTED' AND version = ?
+
+-- rows_affected = 1 → won the race → insert audit row, publish event
+-- rows_affected = 0 → lost the race → discard, no audit insert, no duplicate webhook
+```
+`version` is also written into `payout_audit` — making concurrent attempts traceable.
 
 ---
 
@@ -309,6 +322,36 @@ After: reaching `SUBMITTED` *is* the guarantee. Refund worker does exactly one t
 <div class="danger">
 <strong>REFUND_FAILED</strong> — money is with Boku, held by neither party. Zero-tolerance alert: page oncall immediately, no acknowledgement window.
 </div>
+
+---
+
+# Cancellation — Boundary at the First External Call
+
+**Rule:** `POST /payouts/{id}/cancel` is only permitted **before any external API call has been made**.
+
+| Status | Cancellable? | Why |
+|---|---|---|
+| `PENDING` | ✅ Yes | DB insert + Kafka only — no external call |
+| `PENDING_COMPLIANCE` | ✅ Yes | Compliance is Boku-internal — no partner contacted |
+| `PENDING_MANUAL_REVIEW` | ✅ Yes | Human queue — safe to withdraw |
+| `FUND_PULLING` | ❌ No | Fund pull API already called — unknown mid-flight state |
+| `SUBMITTED` and beyond | ❌ No | Disbursement rail called — use refund flow instead |
+| Any terminal state | ❌ No | Already resolved — return `422` |
+
+**Response on non-cancellable state — `422`, not `409`:**
+```json
+{ "error_code": "CANCELLATION_NOT_ALLOWED",
+  "message": "Payout is in FUND_PULLING. Cancellation not permitted after external API call.
+              Funds will be refunded automatically if disbursement fails." }
+```
+`409` implies a retry might work. `422` is unambiguous: the window is closed.
+
+**Race condition — cancel vs. compliance-pass arriving simultaneously:**
+```sql
+UPDATE payouts SET status='CANCELLED', version=version+1
+WHERE payout_id=? AND status IN ('PENDING','PENDING_COMPLIANCE','PENDING_MANUAL_REVIEW') AND version=?
+-- rows_affected=0 → status advanced past cancellable window → re-read → return 422
+```
 
 ---
 

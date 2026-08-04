@@ -104,7 +104,7 @@ Design a Payouts API that lets a caller submit a payout to a beneficiary, expose
 | `GET /payouts?external_ref={ref}` | Look up a payout by the caller's own reference | Recovery path when the caller crashed before persisting `payoutId` — keyed on their identifier, not ours. |
 | `POST /payouts/batch` | Submit multiple payouts as one call | Additive per Assumption 2; fans out to N independent payout records, each with its own state machine. |
 | `GET /payouts/batch/{batchId}` | Batch-level rollup status | Surfaces `succeeded/failed/pending` counts without hiding individual outcomes — partial failure is the expected case. |
-| `POST /payouts/{payoutId}/cancel` | Cancel a payout still in a cancellable state | State-machine guard, not a soft delete. Only `PENDING` payouts are cancellable — idempotent on already-cancelled. |
+| `POST /payouts/{payoutId}/cancel` | Cancel a payout still in a cancellable state | State-machine guard, not a soft delete. Cancellable only before any external API call has been made — see §3.10. |
 | `POST /webhooks/subscriptions` | Register a callback URL for status-change events | Push-based tracking, complementary to polling. HMAC-signed deliveries. |
 | `POST /quotes` | Lock an FX rate + preview before creating a payout | Optional pre-step for cross-currency payouts. TTL-bound — referencing an expired quote returns `QUOTE_EXPIRED`. |
 | `GET /quotes/{quoteId}` | Fetch a previously issued quote | Check remaining validity before submitting the payout that references it. |
@@ -239,8 +239,32 @@ Runs after `202 Accepted`, before any funds move. Two checks in sequence:
 
 `REFUND_FAILED` is the most serious ops state — money is with Boku, held by neither party. Must page oncall immediately with no acknowledgement window. See the **Traffic Model, SLA & Proactive Alerting** doc for full alert definitions.
 
-**Single-writer guard on every transition:**
-Every state update is guarded by `UPDATE ... WHERE status = 'X'` — two concurrent workers can never both advance the same payout. A duplicate Kafka event landing on the same worker becomes a no-op, not a double transition.
+**Single-writer guard — two layers:**
+
+The `UPDATE ... WHERE status = 'X'` guard handles the common case: a duplicate Kafka event arriving on the same worker type. PostgreSQL's row locking ensures the second writer blocks, re-reads the already-advanced status, and the `WHERE` clause eliminates it as a no-op.
+
+But that is not enough. A different scenario exists: **two independent writer types** — for example, a partner callback arriving at the same time as a midnight batch reconciliation sweep — both read `SUBMITTED` before either commits. Both pass the `WHERE status = 'SUBMITTED'` check, both attempt to write `SETTLED`, both insert an audit row. The result is a duplicate `SETTLED` record and a double webhook delivery.
+
+**Optimistic locking with a `version` column closes this gap:**
+
+```sql
+-- payouts table gets a version column:
+version  INTEGER NOT NULL DEFAULT 0
+
+-- Every state transition reads the current version first, then:
+UPDATE payouts
+SET    status  = 'SETTLED',
+       version = version + 1
+WHERE  payout_id = ?
+  AND  status    = 'SUBMITTED'
+  AND  version   = ?          -- the version the worker read
+
+-- Check rows_affected:
+-- 1 → this worker won the race → proceed to INSERT payout_audit + publish event
+-- 0 → another writer got there first → discard, do not insert audit row, do not publish
+```
+
+The `version` column is also written into `payout_audit` — so the audit trail reflects which version increment produced each row, making concurrent write attempts traceable even under load. The reconciliation job and the callback handler become safe to run simultaneously: exactly one will advance the version; the other will read `rows_affected = 0` and stop cleanly.
 
 `SUBMITTED_UNCONFIRMED` is deliberately non-terminal and deliberately not `FAILED` — a connection drop tells you nothing about whether the partner processed it. Do not refund. Do not failover. Query the partner using the `client_reference` (= Idempotency-Key) to resolve. See §3.9.
 
@@ -332,6 +356,60 @@ The Idempotency-Key needs a uniqueness constraint in the same transactional stor
 - **Egress** (service → partner): `client_reference` = Idempotency-Key on every outbound call
 
 Three layers, three mechanisms, one principle.
+
+### 3.10 Cancellation — boundary at the first external API call
+
+`POST /payouts/{payoutId}/cancel` is a state-machine guard, not a soft delete. The critical rule:
+
+> **Cancellation is only permitted before any external API call has been made.**
+
+Once the system has called an external party — the fund pull rail, the compliance provider, or the disbursement rail — cancellation is no longer safe. The external party may have already acted; a unilateral cancel risks leaving them in an inconsistent state.
+
+**Cancellable states (no external call yet):**
+
+| Status | Cancellable? | Reasoning |
+|---|---|---|
+| `PENDING` | ✅ Yes | Only internal — DB insert + Kafka publish. No external call made. |
+| `PENDING_COMPLIANCE` | ✅ Yes | Compliance check is in-flight, but it is Boku-internal. No funds touched, no partner contacted. |
+| `PENDING_MANUAL_REVIEW` | ✅ Yes | Waiting on a human reviewer. Safe to cancel — notify reviewer to discard. |
+
+**Non-cancellable states (external call already made or funds in motion):**
+
+| Status | Cancellable? | Correct path |
+|---|---|---|
+| `FUND_PULLING` | ❌ No | Fund pull API call is in-flight or completed. Stopping mid-pull leaves mandate in unknown state. |
+| `SUBMITTED` and beyond | ❌ No | Disbursement rail has been called. Funds are with Boku or en route. Use the refund flow. |
+| Any terminal state | ❌ No | Already resolved — `SETTLED`, `FAILED`, `REFUNDED`, `REJECTED_COMPLIANCE`, etc. Return `422 Unprocessable`. |
+
+**Response contract:**
+
+```
+POST /payouts/{payoutId}/cancel
+
+→ 200 OK           { payout_id, status: "CANCELLED" }      (was in a cancellable state)
+→ 200 OK           { payout_id, status: "CANCELLED" }      (already cancelled — idempotent)
+→ 422 Unprocessable { error_code: "CANCELLATION_NOT_ALLOWED",
+                       message: "Payout is in FUND_PULLING — cancellation not permitted after external API call. If you need funds returned, they will be refunded automatically on failure." }
+```
+
+**The `422` response must tell the caller what to do instead** — "wait for the outcome; if it fails, the refund flow triggers automatically." Do not return `409 Conflict` (which implies a retry might work) or `400` (which implies the request was malformed).
+
+**Implementation — optimistic lock on the cancel transition:**
+
+```sql
+UPDATE payouts
+SET    status  = 'CANCELLED',
+       version = version + 1
+WHERE  payout_id = ?
+  AND  status IN ('PENDING', 'PENDING_COMPLIANCE', 'PENDING_MANUAL_REVIEW')
+  AND  version = ?
+
+-- rows_affected = 1 → cancelled successfully
+-- rows_affected = 0 → status advanced past the cancellable window between the read and this write
+--                     → re-read current status → return 422 with current state
+```
+
+The optimistic lock matters here too: a cancel request and a compliance-pass event can race. The `version` check ensures only one wins — if the compliance worker advanced the payout to `FUND_PULLING` between the cancel handler's read and write, `rows_affected = 0` and the cancel handler re-reads `FUND_PULLING` and returns `422`.
 
 ---
 
