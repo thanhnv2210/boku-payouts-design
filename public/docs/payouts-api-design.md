@@ -204,7 +204,7 @@ FUND_PULLING → FUND_PULL_FAILED                                       (pull fa
 
 SUBMITTED → SETTLED                                                   (rail confirms — terminal)
 SUBMITTED → FAILED                                                    (rail rejects non-retryable — terminal)
-SUBMITTED → RETURNED                                                  (rail accepted, later reversed — terminal)
+SUBMITTED → RETURNED                                                  (rail accepted, later reversed — see trigger definition in §3.4)
 SUBMITTED → SUBMITTED_UNCONFIRMED                                     (connection dropped — outcome unknown)
 SUBMITTED_UNCONFIRMED → SETTLED | FAILED                              (partner-reference lookup only — never guessed)
 
@@ -293,6 +293,24 @@ The outcome is unknown — neither assume success nor failure. Query the partner
 **Partial failures (batch).**
 Each payout inside a batch is its own state-machine instance. The batch resource is a read-only rollup (`succeeded/failed/pending` counts + links to child payouts) — never an all-or-nothing outcome.
 
+**`RETURNED` — who triggers it and how.**
+`RETURNED` means the rail accepted the disbursement but later reversed it — funds come back to Boku. Three triggers are possible, each with a different entry path:
+1. **Partner async callback** — the rail sends a reversal notification (most common for card-push corridors). The Webhook Dispatcher receives and routes it to the Disbursement Worker, which writes `RETURNED`.
+2. **Scheduled reconciliation** — the nightly partner settlement report shows a payout as reversed that was previously `SETTLED` in Boku's ledger. The reconciliation job writes `RETURNED` and triggers the refund flag.
+3. **Manual ops action** — a compliance hold or dispute resolution results in a forced reversal. An ops admin endpoint writes `RETURNED` with a `triggered_by = 'manual-ops'` audit row.
+
+All three paths write the same `RETURNED` status and the same `REFUND_REQUIRED` flag — the refund flow is identical regardless of trigger. The `triggered_by` column in `payout_audit` is what distinguishes them for reporting.
+
+**`PENDING_MANUAL_REVIEW` — system behaviour on SLA breach.**
+The observability doc defines alert thresholds (8h warning, 24h critical) but the system must also have a defined automatic behaviour when the SLA breaches — human response cannot be assumed. Two options:
+- **Auto-reject at 24h** — if no reviewer decision is recorded within 24h, the system writes `REJECTED_COMPLIANCE` with `failure_reason = MANUAL_REVIEW_TIMEOUT`. Simpler, safer, predictable. May frustrate merchants with legitimate payouts caught in a queue backlog.
+- **Auto-escalate and hold** — extend the hold, page the compliance team lead, but do not auto-reject. Appropriate where false-positive consequences (rejecting a legitimate payment) outweigh the hold-time cost.
+
+This is a **policy decision, not a technical one** — the system needs to be told which applies. The design assumes auto-reject at 24h as the default (safer from a sanctions-liability perspective) but this must be confirmed with the compliance team before go-live. The chosen policy must be disclosed to merchants in the API contract.
+
+**Beneficiary pre-validation — out of scope, worth naming.**
+Some corridors (sub-Saharan Africa, parts of SE Asia) have high `BENEFICIARY_ACCOUNT_INVALID` rates at disbursement time — after funds have already been pulled. A `POST /beneficiaries/validate` endpoint that performs a lightweight account-existence check before payout submission would catch these failures earlier (before `FUND_PULLING`) and avoid the refund flow entirely for this failure class. Excluded from this design iteration as it requires per-corridor partner support, but it is a strong UX argument for a Phase 2 addition. Worth surfacing in the walkthrough as a named known gap.
+
 **Refund failure (`REFUND_FAILED`).**
 The refund push to the caller's account also failed. Money is with Boku. This is the only state with a zero-tolerance alert policy — page oncall with no ack window; manual reconciliation with finance required. See observability doc for `REFUND_FAILED_ANY` alert definition.
 
@@ -300,9 +318,12 @@ The refund push to the caller's account also failed. Money is with Boku. This is
 
 Two complementary mechanisms — neither replaces the other:
 - **Pull**: `GET /payouts/{id}` — always correct, caller-paced. The `history` array (sourced from `payout_audit`) gives full per-step timing. Good for backfilling after an outage or for low-volume callers.
-- **Push**: webhook on every state transition, HMAC-signed. Boku retries failed deliveries with backoff; exhausted deliveries land in a DLQ.
+- **Push**: webhook on every state transition, HMAC-signed. Retry policy: up to **8 attempts** with exponential backoff (1s, 2s, 4s, 8s, 30s, 5min, 30min, 2h) — total window ~3h. After exhaustion, the event lands in a DLQ and an ops alert fires. The merchant can request a replay via an admin endpoint. Timeout per attempt: 10s. Any 2xx response is considered success; anything else (4xx, 5xx, timeout) triggers the next retry.
 
 Webhooks are a convenience layer — `GET /payouts/{id}` must always reflect true current state even if every webhook delivery failed.
+
+**Webhook event ordering — merchants must not assume delivery order.**
+Kafka fan-out + per-subscriber retry means `payout.settled` can arrive before `payout.submitted` at a merchant's endpoint (if an earlier delivery failed and retried after a later one succeeded). Merchants must implement **last-write-wins keyed on payout status precedence**, not arrival order. The API contract must document this explicitly: *"Process each event independently. If you receive a terminal state event (`SETTLED`, `FAILED`, `REFUNDED`) and already hold a non-terminal state for the same `payout_id`, apply the terminal state regardless of delivery order."* This is a common integration bug — it should be called out in the SDK and developer documentation, not left to discovery.
 
 ### 3.6 Reconciliation
 
@@ -322,10 +343,12 @@ The real reason for a two-step flow is **FX rate locking**, not human review:
 ### 3.8 Security & observability
 
 **Security:**
+- **Merchant authentication — OAuth2 client credentials (machine-to-machine).** Each merchant is issued a `client_id` / `client_secret` and exchanges them for a short-lived JWT bearer token via `/oauth/token`. The JWT carries `merchant_id` as a claim — scoped into every payout record at creation time. API keys (static, long-lived) are the simpler alternative but carry higher breach risk; OAuth2 client credentials match the B2B, server-to-server call pattern here.
 - **mTLS** for all partner-facing rail calls — mutual authentication, not just server auth
 - **HMAC-SHA256 signed** webhook payloads — callers verify the `X-Boku-Signature` header before processing
-- **Secrets Manager** for partner API keys and mTLS certs — rotated without redeployment
+- **Secrets Manager** for partner API keys, mTLS certs, and OAuth2 client secrets — rotated without redeployment
 - **Correlation ID** generated at `POST /payouts`, threaded through every log line, Kafka event, and partner call for that payout's lifetime
+- **PII / GDPR tension with the append-only audit table** — the audit table stores `payout_id` which joins to beneficiary name and account number. A GDPR right-to-erasure request creates a direct conflict with the append-only guarantee. Resolution: store only a pseudonymous `beneficiary_token` (HMAC of account number + merchant salt) in `payout_audit`. Raw PII stays only in the `payouts` table, where it can be overwritten with a tombstone on erasure request without corrupting the audit trail. The token still supports reconciliation — same input produces the same token. Retention policy for raw PII and audit rows needs to be defined before go-live (typically 7 years for financial records in most jurisdictions, but erasure of personal fields is possible while preserving the financial fact).
 
 **Observability:**
 The `payout_audit` table (§2 terminology, §3.3) is the foundation for all monitoring — per-step `duration_ms` rows power SLA dashboards and proactive alerting. See the **Traffic Model, SLA & Proactive Alerting** document for:
@@ -465,6 +488,7 @@ If merchant SLA requires sub-minute refund initiation (e.g. consumer-facing corr
 |---|---|---|
 | Public API entry | **API Gateway** | Request validation, auth, rate limiting before traffic reaches compute |
 | Payout services | **EKS** | Six Spring Boot microservices as separate deployables: Payout Service, Compliance Service, Fund Pull Worker, Disbursement Worker, Refund Worker, Webhook Dispatcher |
+| Refund Batch Job | **Lambda + EventBridge Scheduler** | Scheduled pickup of `REFUND_REQUIRED` records (§3.11) — same pattern as reconciliation. Runs every 5min (configurable per corridor). `SELECT FOR UPDATE SKIP LOCKED` ensures safe concurrent execution. |
 | Event backbone | **MSK (managed Kafka)** | 6 topics (see observability doc §1.3); durable, ordered, replayable event log for all state transitions |
 | System of record | **RDS PostgreSQL** | ACID guarantees for payout ledger + payout_audit + idempotency-key table — all three need real transactions |
 | Retry / DLQ | **SQS + DLQ** | Per-rail and per-worker retry queues with backoff; exhausted messages land in DLQ for follow-up |
@@ -498,15 +522,15 @@ Assumes a blank-slate AWS environment, consistent with Boku's greenfield Banking
 
 | Role | What they need | Covered | Gap |
 |---|---|---|---|
-| **Customer** (merchant/platform) | Predictable behaviour, no duplicate charges, clear status visibility, fast failure diagnosis | Idempotency-Key (§3.4/§3.9), dual pull+push tracking (§3.5), structured `error_code`/`failure_reason`, full history in `GET /payouts/{id}` | No stated SLA on max time in `PENDING_COMPLIANCE` / `SUBMITTED_UNCONFIRMED`; no rate-limit contract; no API versioning policy |
-| **PO** | Clear scope, MVP vs. later, business justification | Quote + batch explicitly "additive, not foundational"; Pull-and-Pay vs. prefunded named as a live question; compliance gate as optional per-corridor | No Phase 1 / Phase 2 scope line; no success metrics (payout success rate, time-to-settle); no cost-per-rail tradeoff |
-| **Developer** | Reasoned state model, testable contracts, low ambiguity | Full state machine (§3.3), Correlation-ID vs. Idempotency-Key split (§3.9), consistent error shape, audit table schema | No test strategy (contract tests, chaos rail failures); no API versioning scheme; no client SDK story for REST + gRPC |
-| **DevOps** | Deployability, observability, scaling, secrets | Full AWS mapping (§4): 6 EKS microservices, MSK, RDS, SQS+DLQ, Secrets Manager, CloudWatch+X-Ray | No canary/blue-green deployment strategy; no EKS autoscaling policy for submission bursts; Terraform named but not detailed |
-| **Operation Team** | Investigate stuck payouts, manual intervention, alerting | `SUBMITTED_UNCONFIRMED` + `REFUND_PENDING` age alerts (☑ in observability doc), `payout_audit` for per-step trace, DLQ for exhausted retries | No admin API/dashboard; no manual override/force-resolve endpoint; runbooks are stubs — data supports them but procedures not yet written |
-| **Financial team** | Immutable audit trail, reconciliation accuracy, dispute resolution | `payout_audit` is append-only (§3.3); reconciliation matches internal ledger vs. partner records (§3.6); `REFUNDED` trail: pull → failed → refunded | No GL/accounting-system integration point; no audit-log retention policy; no explicit handling of how `RETURNED` reconciles back into finance's books |
+| **Customer** (merchant/platform) | Predictable behaviour, no duplicate charges, clear status visibility, fast failure diagnosis | Idempotency-Key (§3.4/§3.9), dual pull+push tracking (§3.5), webhook retry policy + event ordering contract (§3.5), structured `error_code`/`failure_reason`, full history in `GET /payouts/{id}` | No stated SLA on max time in `PENDING_COMPLIANCE` / `SUBMITTED_UNCONFIRMED`; no rate-limit contract; no API versioning policy; beneficiary pre-validation out of scope (§3.4) |
+| **PO** | Clear scope, MVP vs. later, business justification | Quote + batch explicitly "additive, not foundational"; Pull-and-Pay vs. prefunded named as a live question; compliance gate as optional per-corridor; `PENDING_MANUAL_REVIEW` auto-reject policy defined (§3.4) | No Phase 1 / Phase 2 scope line; no success metrics (payout success rate, time-to-settle); no cost-per-rail tradeoff |
+| **Developer** | Reasoned state model, testable contracts, low ambiguity | Full state machine (§3.3), all `RETURNED` trigger paths defined (§3.4), Correlation-ID vs. Idempotency-Key split (§3.9), consistent error shape, audit table schema, webhook ordering contract (§3.5) | No test strategy (contract tests, chaos rail failures); no API versioning scheme; no client SDK story for REST + gRPC |
+| **DevOps** | Deployability, observability, scaling, secrets | Full AWS mapping (§4): 6 EKS microservices + Refund Batch Job (Lambda + EventBridge), MSK, RDS, SQS+DLQ, Secrets Manager, CloudWatch+X-Ray | No canary/blue-green deployment strategy; no EKS autoscaling policy for submission bursts; Terraform named but not detailed |
+| **Operation Team** | Investigate stuck payouts, manual intervention, alerting | `SUBMITTED_UNCONFIRMED` + `REFUND_PENDING` age alerts (☑ in observability doc), `payout_audit` for per-step trace, DLQ for exhausted retries, `RETURNED` manual-ops trigger path (§3.4) | No admin API/dashboard; no manual override/force-resolve endpoint; runbooks are stubs — data supports them but procedures not yet written |
+| **Financial team** | Immutable audit trail, reconciliation accuracy, dispute resolution | `payout_audit` append-only with pseudonymised PII + GDPR erasure approach (§3.8); reconciliation covers all `RETURNED` trigger paths (§3.4, §3.6); `REFUNDED` trail complete | No GL/accounting-system integration point; PII retention period not set (jurisdiction-dependent); no explicit GL entry for `RETURNED` reversals |
 | **Stakeholder** (exec/business) | Risk, cost, time-to-market, scalability story | Greenfield rationale; AWS choices justified against DASH-proven patterns at real scale | No TCO/cost estimate; no phased timeline; no risk register |
 
-**The honest read:** strongest on Customer / Developer / DevOps — these map directly onto DASH-proven patterns. Operation Team coverage improved materially with the observability doc (audit table, alert thresholds, dashboard definitions), but the runbooks are still stubs. Financial team and Stakeholder remain the thinnest. Naming these gaps unprompted is a stronger answer than overclaiming coverage.
+**The honest read:** strongest on Customer / Developer / DevOps — these map directly onto DASH-proven patterns. Operation Team coverage improved materially with the observability doc and the addition of `RETURNED` trigger paths, webhook ordering contract, and `PENDING_MANUAL_REVIEW` auto-reject policy. Financial team is meaningfully stronger with the GDPR/pseudonymisation approach named. Stakeholder remains the thinnest. Naming these gaps unprompted is a stronger answer than overclaiming coverage.
 
 ---
 
