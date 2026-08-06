@@ -53,7 +53,7 @@ export default function App() {
         <FileExplorer tree={tree} selected={selectedDoc} onSelect={handleSelect} />
         <div className="rail-tools">
           <span className="rail-tools-label">Tools</span>
-          <a className="rail-tools-link" href="/api-docs/" target="_blank" rel="noopener noreferrer">
+          <a className="rail-tools-link" href="/api-docs/?server=https://mywiremockserver-production.up.railway.app" target="_blank" rel="noopener noreferrer">
             API Playground ↗
           </a>
         </div>

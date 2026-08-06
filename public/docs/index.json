@@ -48,7 +48,8 @@
           "id": "funding-models",
           "title": "Funding Models — Prefunded vs. Pull-and-Pay",
           "type": "plantuml",
-          "path": "docs/diagrams/funding-models.puml"
+          "path": "docs/diagrams/funding-models.puml",
+          "hidden": true
         }
       ]
     }

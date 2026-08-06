@@ -1,4 +1,6 @@
 function TreeNode({ node, depth, selected, onSelect }) {
+  if (node.hidden) return null
+
   if (node.children) {
     return (
       <li className="tree-folder">
@@ -6,7 +8,7 @@ function TreeNode({ node, depth, selected, onSelect }) {
           {node.label}
         </span>
         <ul>
-          {node.children.map(child => (
+          {node.children.filter(c => !c.hidden).map(child => (
             <TreeNode key={child.id} node={child} depth={depth + 1} selected={selected} onSelect={onSelect} />
           ))}
         </ul>
