@@ -19,9 +19,9 @@
 
 ---
 
-## Slide 3 — 4 Assumptions
+## Slide 3 — 3 Assumptions
 
-"Before I get into the design, four assumptions I had to resolve — because the task leaves them open and each one changes the architecture meaningfully. Async submission, single payout as the primary unit, platform picks the rail, and Pull-and-Pay as the primary flow. I'll unpack the two most interesting ones on the next slides."
+"Before I get into the design, three assumptions I had to resolve — because the task leaves them open and each one changes the architecture meaningfully. Async submission, platform picks the rail, and Pull-and-Pay as the primary flow. I'll unpack each one on the next slides."
 
 ---
 
@@ -31,13 +31,13 @@
 
 ---
 
-## Slide 5 — Assumption 3: Rail Selection
+## Slide 5 — Assumption 2: Rail Selection
 
 "Boku operates in 65 countries. Singapore, Kenya, and the US ride completely different rails. My decision: the caller specifies what they want to do and who the beneficiary is — the platform decides how to route it. If I let callers specify the rail explicitly, I've leaked internal partner topology into a public contract. Every time we onboard a new rail or change a partner, callers need to update their code. The platform-picks model keeps the caller API stable while giving us full flexibility on the routing layer."
 
 ---
 
-## Slide 6 — Assumption 4: Pull-and-Pay
+## Slide 6 — Assumption 3: Pull-and-Pay
 
 "Pull-and-Pay is more complex than a prefunded wallet, but it's the right showcase because it forces the complete design. The compliance gate must run before any funds move — that's a hard constraint. Having FUND_PULLING as an explicit state means that reaching SUBMITTED is a guarantee: funds are with Boku. That single insight eliminates an entire class of conditional logic in the refund worker — I'll come back to that when we get to refunds."
 

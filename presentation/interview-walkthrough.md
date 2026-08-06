@@ -171,16 +171,15 @@ The **Pull-and-Pay funding model with a compliance gate** — the most complex r
 
 ---
 
-# 4 Assumptions
+# 3 Assumptions
 
 Each resolves a scenario the task leaves open.
 
 | # | Assumption | Key trade-off |
 |---|---|---|
 | 1 | **Submission sync, settlement async** | `202 Accepted` + async tracking vs. coupling API uptime to rail latency |
-| 2 | **Single payout = primary unit; batch is additive** | Get idempotency right on one payout first, then compose |
-| 3 | **Platform picks the rail, caller doesn't** | Hides internal topology; Boku's value prop is the 65-country coverage |
-| 4 | **Pull-and-Pay as primary showcase** | Forces full design: compliance gate, fund pull state, refund flow |
+| 2 | **Platform picks the rail, caller doesn't** | Hides internal topology; Boku's value prop is the 65-country coverage |
+| 3 | **Pull-and-Pay as primary showcase** | Forces full design: compliance gate, fund pull state, refund flow |
 
 ---
 
@@ -202,7 +201,7 @@ GET /payouts/{id}      →   { status: SETTLED, history: [...] }
 
 ---
 
-# Assumption 3 — Rail Selection Is the Platform's Job
+# Assumption 2 — Rail Selection Is the Platform's Job
 
 **Scenario:** Boku is global (65 countries) — Singapore, Kenya, and the US ride completely different rails.
 
@@ -218,7 +217,7 @@ GET /payouts/{id}      →   { status: SETTLED, history: [...] }
 
 ---
 
-# Assumption 4 — Pull-and-Pay as the Showcase
+# Assumption 3 — Pull-and-Pay as the Showcase
 
 | Model | How it works | Design impact |
 |---|---|---|
