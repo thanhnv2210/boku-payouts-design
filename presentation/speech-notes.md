@@ -131,7 +131,12 @@
 
 ## Slide 21 — Demo
 
-"Let me show you the live system. This is the API Playground pointed at a WireMock instance running on Railway — real HTTP calls. Try pyo_SETTLED_001 first for the happy path with full timing in the history. Then pyo_UNCONF_001 for the SUBMITTED_UNCONFIRMED scenario. And there's a flow simulation on the main site where you can watch the state machine execute step by step alongside what a merchant would see as webhook events arrive — let me pull that up."
+"Let me show you the flow simulation — you can watch the state machine execute step by step and see exactly what webhook events a merchant would receive at each transition. It makes the async model concrete."
+
+[ Open boku.thanhnguyen.dev and run a scenario ]
+
+[ If they want to go deeper into the HTTP layer: ]
+"There's also a live API Playground wired to a WireMock server if you'd like to hit the actual endpoints — pyo_SETTLED_001 for the happy path, pyo_UNCONF_001 for the ambiguous failure scenario."
 
 ---
 

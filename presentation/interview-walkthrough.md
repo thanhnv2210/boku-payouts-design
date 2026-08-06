@@ -548,16 +548,12 @@ If prefunded → remove `FUND_PULLING` / `FUND_PULL_FAILED` / refund flow; add w
 
 # Demo
 
-**Live API Playground**
-`https://boku.thanhnguyen.dev/api-docs/`
-`?server=https://mywiremockserver-production.up.railway.app`
+**Flow Simulation** — <a href="https://boku.thanhnguyen.dev" target="_blank">boku.thanhnguyen.dev ↗</a>
 
-### Demo IDs to try
-- `pyo_SETTLED_001` — happy path with full history + timing
-- `pyo_FAILED_001` — `BENEFICIARY_ACCOUNT_INVALID`
-- `pyo_UNCONF_001` — `SUBMITTED_UNCONFIRMED`
-- `btc_DEMO_001` — batch: 8 settled / 2 failed
-- `qte_EXPIRED_001` — expired FX quote
+Watch the state machine execute step by step — each transition fires a webhook event in real time, exactly as a merchant would receive it.
+
+> **API Playground also available** if you'd like to explore the raw HTTP layer
+> <a href="https://boku.thanhnguyen.dev/api-docs/?server=https://mywiremockserver-production.up.railway.app" target="_blank">boku.thanhnguyen.dev/api-docs ↗</a>
 
 ---
 
