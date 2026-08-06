@@ -6187,7 +6187,7 @@ section.dense p {
 </tr>
 <tr>
 <td>5</td>
-<td><strong>Refund Batch Job absent from §4</strong></td>
+<td><strong>Refund Batch Job not in AWS mapping</strong></td>
 <td>Added to AWS mapping: Lambda + EventBridge Scheduler, same pattern as reconciliation</td>
 </tr>
 <tr>
@@ -6503,7 +6503,7 @@ section.dense p {
 ;" data-marpit-pagination-total="23">
 <h1 id="open-questions-for-the-walkthrough">Open Questions for the Walkthrough</h1>
 <p><strong>Q1 — Managed service or connectivity layer?</strong><br />
-If caller specifies the rail → rail selection layer gone, failover-blocking in <code>SUBMITTED_UNCONFIRMED</code> simplified. Changes the entire §3.9 story.</p>
+If caller specifies the rail → rail selection layer gone, failover-blocking in <code>SUBMITTED_UNCONFIRMED</code> simplified. Changes the entire rail routing story.</p>
 <p><strong>Q2 — If platform picks rail: priority-ordered fallback or multi-rail scoring?</strong></p>
 <ul>
 <li>Priority-ordered fallback → circuit breaker model, current design applies</li>

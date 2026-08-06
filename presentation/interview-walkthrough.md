@@ -523,7 +523,7 @@ CREATE TABLE payout_audit (
 | 2 | **`RETURNED` had no trigger** | Three paths: partner async callback, nightly reconciliation report, manual ops action — all write same status, `triggered_by` distinguishes them |
 | 3 | **Webhook retry policy vague** | 8 attempts, exponential backoff (1s→2h total window), 10s timeout, any 2xx = success, exhaustion → DLQ + ops alert + replay endpoint |
 | 4 | **Webhook ordering not contractual** | Merchants must key on status precedence not delivery order — "if you receive `SETTLED` and already hold a non-terminal status, apply `SETTLED`" — documented in SDK |
-| 5 | **Refund Batch Job absent from §4** | Added to AWS mapping: Lambda + EventBridge Scheduler, same pattern as reconciliation |
+| 5 | **Refund Batch Job not in AWS mapping** | Added to AWS mapping: Lambda + EventBridge Scheduler, same pattern as reconciliation |
 | 6 | **`PENDING_MANUAL_REVIEW` timeout undefined** | Auto-reject at 24h default (`failure_reason = MANUAL_REVIEW_TIMEOUT`) — policy decision, must confirm with compliance team, must disclose to merchants |
 | 7 | **Beneficiary pre-validation missing** | Named as Phase 2: `POST /beneficiaries/validate` — reduces `BENEFICIARY_ACCOUNT_INVALID` rate before `FUND_PULLING`, avoids unnecessary refund flow |
 | 8 | **GDPR vs. append-only audit table** | Store `beneficiary_token` (HMAC) in `payout_audit`, raw PII only in `payouts` table — supports erasure without corrupting financial audit trail |
@@ -533,7 +533,7 @@ CREATE TABLE payout_audit (
 # Open Questions for the Walkthrough
 
 **Q1 — Managed service or connectivity layer?**
-If caller specifies the rail → rail selection layer gone, failover-blocking in `SUBMITTED_UNCONFIRMED` simplified. Changes the entire §3.9 story.
+If caller specifies the rail → rail selection layer gone, failover-blocking in `SUBMITTED_UNCONFIRMED` simplified. Changes the entire rail routing story.
 
 **Q2 — If platform picks rail: priority-ordered fallback or multi-rail scoring?**
 - Priority-ordered fallback → circuit breaker model, current design applies
