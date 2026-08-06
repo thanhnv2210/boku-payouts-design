@@ -21,8 +21,8 @@ state "REFUND_REQUIRED" as RR #ffe8cc
 state "REFUND_PENDING" as RP #fff3e0
 state "SETTLED" as SETTLED #e4efe6         : Terminal
 state "FUND_PULL_FAILED" as FPF #f1dcd6    : Terminal
-state "FAILED" as FAILED #f1dcd6           : Terminal
-state "RETURNED" as RETURNED #f1dcd6       : Terminal
+state "FAILED" as FAILED #f1dcd6
+state "RETURNED" as RETURNED #f1dcd6
 state "REFUNDED" as REFUNDED #e4efe6       : Terminal
 state "REFUND_FAILED" as RF #f1dcd6        : Terminal\n(manual intervention)
 state "REJECTED_COMPLIANCE" as RC #f1dcd6  : Terminal
@@ -89,10 +89,10 @@ RETURNED --> RP : [immediate]\nPull-and-Pay:\nevent-driven refund
 UNCONF   --> RP : [immediate]\nlookup resolves failed
 
 ' Option B — batch job via REFUND_REQUIRED (dashed = optional design)
-FAILED   ..> RR : [batch]\nPull-and-Pay:\nflag for batch job
-RETURNED ..> RR : [batch]\nPull-and-Pay:\nflag for batch job
-UNCONF   ..> RR : [batch]\nlookup resolves failed
-RR       ..> RP : Refund Batch Job\npicks up record\n(SELECT FOR UPDATE\nSKIP LOCKED)
+FAILED   -[dashed]-> RR : [batch]\nPull-and-Pay:\nflag for batch job
+RETURNED -[dashed]-> RR : [batch]\nPull-and-Pay:\nflag for batch job
+UNCONF   -[dashed]-> RR : [batch]\nlookup resolves failed
+RR       -[dashed]-> RP : Refund Batch Job\npicks up record\n(SELECT FOR UPDATE\nSKIP LOCKED)
 
 note right of RR
   Optional intermediate state.
@@ -134,10 +134,8 @@ end note
 
 SETTLED   --> [*]
 REFUNDED  --> [*]
-FAILED    --> [*]
 FPF       --> [*]
 RF        --> [*]
-RETURNED  --> [*]
 RC        --> [*]
 CANCELLED --> [*]
 

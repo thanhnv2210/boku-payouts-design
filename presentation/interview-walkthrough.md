@@ -550,7 +550,7 @@ If prefunded → remove `FUND_PULLING` / `FUND_PULL_FAILED` / refund flow; add w
 # Demo
 
 **Live API Playground**
-`https://boku-payouts-design.vercel.app/api-docs/`
+`https://boku.thanhnguyen.dev/api-docs/`
 `?server=https://mywiremockserver-production.up.railway.app`
 
 ### Demo IDs to try
@@ -559,3 +559,28 @@ If prefunded → remove `FUND_PULLING` / `FUND_PULL_FAILED` / refund flow; add w
 - `pyo_UNCONF_001` — `SUBMITTED_UNCONFIRMED`
 - `btc_DEMO_001` — batch: 8 settled / 2 failed
 - `qte_EXPIRED_001` — expired FX quote
+
+---
+
+<!-- _class: title -->
+
+# Q&A
+
+**What would you like to dig into?**
+
+- State machine edge cases (UNCONF, RETURNED, refund paths)
+- Rail selection & circuit breaker logic
+- Compliance gate — sequence, timeouts, regulatory reporting
+- Batch vs. event-driven refund trade-offs
+- AWS service choices & cost model
+- Design gaps & what's intentionally deferred
+
+---
+
+<!-- _class: title -->
+
+# Thank You
+
+**Thanh Nguyen**
+
+`boku.thanhnguyen.dev`

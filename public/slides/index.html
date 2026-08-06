@@ -300,7 +300,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="payouts-api">Payouts API</h1>
 <h2 id="high-level-design">High-Level Design</h2>
 <p><strong>Boku — Banking &amp; Settlement</strong><br />
@@ -598,7 +598,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="the-task">The Task</h1>
 <blockquote>
 <p>Design a Payouts API that lets a caller submit a payout to a beneficiary, exposes clear endpoints and request/response contracts, handles duplicate requests / failed disbursements / partial failures, and lets the caller track status after submission.</p>
@@ -898,7 +898,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="4-assumptions">4 Assumptions</h1>
 <p>Each resolves a scenario the task leaves open.</p>
 <table>
@@ -1225,7 +1225,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="assumption-1--async-by-design">Assumption 1 — Async by Design</h1>
 <p><strong>Scenario:</strong> <code>POST /payouts</code> hits the API. The actual funds movement can take seconds to multiple business days depending on corridor and rail.</p>
 <p><strong>Decision:</strong> <code>202 Accepted</code> immediately. Acceptance path = thin DB write + fire-and-forget Kafka publish, <strong>&lt; 50ms P95</strong> — comfortably inside any API Gateway timeout.</p>
@@ -1529,7 +1529,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="assumption-3--rail-selection-is-the-platforms-job">Assumption 3 — Rail Selection Is the Platform's Job</h1>
 <p><strong>Scenario:</strong> Boku is global (65 countries) — Singapore, Kenya, and the US ride completely different rails.</p>
 <p><strong>Decision:</strong> Caller specifies <strong>what</strong> and <strong>to whom</strong>. Platform decides <strong>how</strong>.</p>
@@ -1851,7 +1851,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="assumption-4--pull-and-pay-as-the-showcase">Assumption 4 — Pull-and-Pay as the Showcase</h1>
 <table>
 <thead>
@@ -2176,7 +2176,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="api-surface">API Surface</h1>
 <table>
 <thead>
@@ -2518,7 +2518,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="payout-state-machine">Payout State Machine</h1>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code>PENDING → PENDING_COMPLIANCE → FUND_PULLING → SUBMITTED → SETTLED    ← happy path
 PENDING → FUND_PULLING → SUBMITTED → SETTLED                          ← no compliance gate
@@ -2843,7 +2843,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="compliance-gate--before-any-funds-move">Compliance Gate — Before Any Funds Move</h1>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code>payout.created (Kafka)
         ↓
@@ -3154,7 +3154,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="the-submitted_unconfirmed-problem">The <code>SUBMITTED_UNCONFIRMED</code> Problem</h1>
 <p><strong>Scenario:</strong> Disbursement worker sends to Partner Rail. Connection drops. Did the partner process it?</p>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code>DW → Rail: submit disbursement (client_reference = Idempotency-Key)
@@ -3467,7 +3467,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="refund-trigger--simplified-by-fund_pulling-separation">Refund Trigger — Simplified by <code>FUND_PULLING</code> Separation</h1>
 <table>
 <thead>
@@ -3804,7 +3804,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="refund-design--refund_required--batch-job">Refund Design — <code>REFUND_REQUIRED</code> + Batch Job</h1>
 <p><strong>Updated state machine for refunds:</strong></p>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code>FAILED / RETURNED → REFUND_REQUIRED → REFUND_PENDING → REFUNDED | REFUND_FAILED
@@ -4152,7 +4152,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="cancellation--boundary-at-the-first-external-call">Cancellation — Boundary at the First External Call</h1>
 <p><strong>Rule:</strong> <code>POST /payouts/{id}/cancel</code> is only permitted <strong>before any external API call has been made</strong>.</p>
 <table>
@@ -4500,7 +4500,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="idempotency--three-layers-one-principle">Idempotency — Three Layers, One Principle</h1>
 <p><strong>Idempotency-Key vs. Correlation-ID — don't collapse them:</strong></p>
 <ul>
@@ -4824,7 +4824,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="observability--audit-table-as-foundation">Observability — Audit Table as Foundation</h1>
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code class="language-sql"><span class="hljs-keyword">CREATE TABLE</span> payout_audit (
     id             BIGSERIAL <span class="hljs-keyword">PRIMARY KEY</span>,
@@ -5134,7 +5134,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="top-5-alerts-from-18-defined">Top 5 Alerts (from 18 defined)</h1>
 <table>
 <thead>
@@ -5474,7 +5474,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="aws-architecture">AWS Architecture</h1>
 <table>
 <thead>
@@ -5821,7 +5821,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="stakeholder-coverage--honest-assessment">Stakeholder Coverage — Honest Assessment</h1>
 <table>
 <thead>
@@ -6159,7 +6159,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="eight-design-gaps--addressed">Eight Design Gaps — Addressed</h1>
 <table>
 <thead>
@@ -6505,7 +6505,7 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="open-questions-for-the-walkthrough">Open Questions for the Walkthrough</h1>
 <p><strong>Q1 — Managed service or connectivity layer?</strong><br />
 If caller specifies the rail → rail selection layer gone, failover-blocking in <code>SUBMITTED_UNCONFIRMED</code> simplified. Changes the entire §3.9 story.</p>
@@ -6809,10 +6809,10 @@ section.dense blockquote {
 section.dense p {
   margin: 6px 0;
 }
-;" data-marpit-pagination-total="21">
+;" data-marpit-pagination-total="23">
 <h1 id="demo">Demo</h1>
 <p><strong>Live API Playground</strong><br />
-<code>https://boku-payouts-design.vercel.app/api-docs/</code><br />
+<code>https://boku.thanhnguyen.dev/api-docs/</code><br />
 <code>?server=https://mywiremockserver-production.up.railway.app</code></p>
 <h3 id="demo-ids-to-try">Demo IDs to try</h3>
 <ul>
@@ -6822,6 +6822,607 @@ section.dense p {
 <li><code>btc_DEMO_001</code> — batch: 8 settled / 2 failed</li>
 <li><code>qte_EXPIRED_001</code> — expired FX quote</li>
 </ul>
+</section>
+</foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="22" data-paginate="true" data-class="title" data-theme="default" data-style=":root {
+  --color-bg: #f5f6f1;
+  --color-fg: #1a1f14;
+  --color-accent: #3a5c2e;
+  --color-accent-light: #6a9c5a;
+  --color-warn: #b85c00;
+  --color-danger: #8b1a1a;
+  --color-muted: #6b7063;
+  --color-note: #f3e8d2;
+  --color-border: #c7cbb4;
+}
+section {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: 'Seravek', 'Gill Sans', 'Trebuchet MS', sans-serif;
+  font-size: 18px;
+  padding: 48px 56px;
+}
+h1 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 2em;
+  border-bottom: 2px solid var(--color-border);
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+}
+h2 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 1.4em;
+  margin-bottom: 16px;
+}
+h3 {
+  color: var(--color-accent-light);
+  font-size: 1em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+code {
+  background: #e8ebe0;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.85em;
+  color: var(--color-accent);
+}
+pre {
+  background: #e8ebe0;
+  border-left: 4px solid var(--color-accent);
+  padding: 16px;
+  border-radius: 4px;
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--color-fg);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+th {
+  background: var(--color-accent);
+  color: white;
+  padding: 8px 12px;
+  text-align: left;
+}
+td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+tr:nth-child(even) td { background: #eceee6; }
+blockquote {
+  background: var(--color-note);
+  border-left: 4px solid var(--color-warn);
+  padding: 12px 16px;
+  margin: 16px 0;
+  border-radius: 0 4px 4px 0;
+  font-style: normal;
+  color: var(--color-fg);
+}
+.danger {
+  background: #f7e8e8;
+  border-left: 4px solid var(--color-danger);
+  padding: 12px 16px;
+  border-radius: 0 4px 4px 0;
+  margin: 12px 0;
+}
+ul { line-height: 1.8; }
+li { margin-bottom: 4px; }
+footer {
+  font-size: 0.7em;
+  color: var(--color-muted);
+}
+section.title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: left;
+}
+section.title h1 {
+  font-size: 2.6em;
+  border: none;
+}
+section.title p {
+  color: var(--color-muted);
+  font-size: 1em;
+  margin-top: 8px;
+}
+section.dense {
+  font-size: 13px;
+  padding: 32px 48px;
+}
+section.dense h1 {
+  font-size: 1.6em;
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+section.dense pre {
+  font-size: 0.7em;
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+section.dense table {
+  font-size: 0.8em;
+}
+section.dense th, section.dense td {
+  padding: 5px 10px;
+}
+section.dense ul {
+  line-height: 1.5;
+}
+section.dense li {
+  margin-bottom: 2px;
+}
+section.dense blockquote {
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 0.9em;
+}
+section.dense p {
+  margin: 6px 0;
+}
+" lang="C" class="title" data-marpit-pagination="22" style="--paginate:true;--class:title;--theme:default;--style::root {
+  --color-bg: #f5f6f1;
+  --color-fg: #1a1f14;
+  --color-accent: #3a5c2e;
+  --color-accent-light: #6a9c5a;
+  --color-warn: #b85c00;
+  --color-danger: #8b1a1a;
+  --color-muted: #6b7063;
+  --color-note: #f3e8d2;
+  --color-border: #c7cbb4;
+}
+section {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: 'Seravek', 'Gill Sans', 'Trebuchet MS', sans-serif;
+  font-size: 18px;
+  padding: 48px 56px;
+}
+h1 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 2em;
+  border-bottom: 2px solid var(--color-border);
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+}
+h2 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 1.4em;
+  margin-bottom: 16px;
+}
+h3 {
+  color: var(--color-accent-light);
+  font-size: 1em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+code {
+  background: #e8ebe0;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.85em;
+  color: var(--color-accent);
+}
+pre {
+  background: #e8ebe0;
+  border-left: 4px solid var(--color-accent);
+  padding: 16px;
+  border-radius: 4px;
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--color-fg);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+th {
+  background: var(--color-accent);
+  color: white;
+  padding: 8px 12px;
+  text-align: left;
+}
+td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+tr:nth-child(even) td { background: #eceee6; }
+blockquote {
+  background: var(--color-note);
+  border-left: 4px solid var(--color-warn);
+  padding: 12px 16px;
+  margin: 16px 0;
+  border-radius: 0 4px 4px 0;
+  font-style: normal;
+  color: var(--color-fg);
+}
+.danger {
+  background: #f7e8e8;
+  border-left: 4px solid var(--color-danger);
+  padding: 12px 16px;
+  border-radius: 0 4px 4px 0;
+  margin: 12px 0;
+}
+ul { line-height: 1.8; }
+li { margin-bottom: 4px; }
+footer {
+  font-size: 0.7em;
+  color: var(--color-muted);
+}
+section.title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: left;
+}
+section.title h1 {
+  font-size: 2.6em;
+  border: none;
+}
+section.title p {
+  color: var(--color-muted);
+  font-size: 1em;
+  margin-top: 8px;
+}
+section.dense {
+  font-size: 13px;
+  padding: 32px 48px;
+}
+section.dense h1 {
+  font-size: 1.6em;
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+section.dense pre {
+  font-size: 0.7em;
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+section.dense table {
+  font-size: 0.8em;
+}
+section.dense th, section.dense td {
+  padding: 5px 10px;
+}
+section.dense ul {
+  line-height: 1.5;
+}
+section.dense li {
+  margin-bottom: 2px;
+}
+section.dense blockquote {
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 0.9em;
+}
+section.dense p {
+  margin: 6px 0;
+}
+;" data-marpit-pagination-total="23">
+<h1 id="qa">Q&amp;A</h1>
+<p><strong>What would you like to dig into?</strong></p>
+<ul>
+<li>State machine edge cases (UNCONF, RETURNED, refund paths)</li>
+<li>Rail selection &amp; circuit breaker logic</li>
+<li>Compliance gate — sequence, timeouts, regulatory reporting</li>
+<li>Batch vs. event-driven refund trade-offs</li>
+<li>AWS service choices &amp; cost model</li>
+<li>Design gaps &amp; what's intentionally deferred</li>
+</ul>
+</section>
+</foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="23" data-paginate="true" data-class="title" data-theme="default" data-style=":root {
+  --color-bg: #f5f6f1;
+  --color-fg: #1a1f14;
+  --color-accent: #3a5c2e;
+  --color-accent-light: #6a9c5a;
+  --color-warn: #b85c00;
+  --color-danger: #8b1a1a;
+  --color-muted: #6b7063;
+  --color-note: #f3e8d2;
+  --color-border: #c7cbb4;
+}
+section {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: 'Seravek', 'Gill Sans', 'Trebuchet MS', sans-serif;
+  font-size: 18px;
+  padding: 48px 56px;
+}
+h1 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 2em;
+  border-bottom: 2px solid var(--color-border);
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+}
+h2 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 1.4em;
+  margin-bottom: 16px;
+}
+h3 {
+  color: var(--color-accent-light);
+  font-size: 1em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+code {
+  background: #e8ebe0;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.85em;
+  color: var(--color-accent);
+}
+pre {
+  background: #e8ebe0;
+  border-left: 4px solid var(--color-accent);
+  padding: 16px;
+  border-radius: 4px;
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--color-fg);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+th {
+  background: var(--color-accent);
+  color: white;
+  padding: 8px 12px;
+  text-align: left;
+}
+td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+tr:nth-child(even) td { background: #eceee6; }
+blockquote {
+  background: var(--color-note);
+  border-left: 4px solid var(--color-warn);
+  padding: 12px 16px;
+  margin: 16px 0;
+  border-radius: 0 4px 4px 0;
+  font-style: normal;
+  color: var(--color-fg);
+}
+.danger {
+  background: #f7e8e8;
+  border-left: 4px solid var(--color-danger);
+  padding: 12px 16px;
+  border-radius: 0 4px 4px 0;
+  margin: 12px 0;
+}
+ul { line-height: 1.8; }
+li { margin-bottom: 4px; }
+footer {
+  font-size: 0.7em;
+  color: var(--color-muted);
+}
+section.title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: left;
+}
+section.title h1 {
+  font-size: 2.6em;
+  border: none;
+}
+section.title p {
+  color: var(--color-muted);
+  font-size: 1em;
+  margin-top: 8px;
+}
+section.dense {
+  font-size: 13px;
+  padding: 32px 48px;
+}
+section.dense h1 {
+  font-size: 1.6em;
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+section.dense pre {
+  font-size: 0.7em;
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+section.dense table {
+  font-size: 0.8em;
+}
+section.dense th, section.dense td {
+  padding: 5px 10px;
+}
+section.dense ul {
+  line-height: 1.5;
+}
+section.dense li {
+  margin-bottom: 2px;
+}
+section.dense blockquote {
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 0.9em;
+}
+section.dense p {
+  margin: 6px 0;
+}
+" lang="C" class="title" data-marpit-pagination="23" style="--paginate:true;--class:title;--theme:default;--style::root {
+  --color-bg: #f5f6f1;
+  --color-fg: #1a1f14;
+  --color-accent: #3a5c2e;
+  --color-accent-light: #6a9c5a;
+  --color-warn: #b85c00;
+  --color-danger: #8b1a1a;
+  --color-muted: #6b7063;
+  --color-note: #f3e8d2;
+  --color-border: #c7cbb4;
+}
+section {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: 'Seravek', 'Gill Sans', 'Trebuchet MS', sans-serif;
+  font-size: 18px;
+  padding: 48px 56px;
+}
+h1 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 2em;
+  border-bottom: 2px solid var(--color-border);
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+}
+h2 {
+  font-family: 'Superclarendon', 'Palatino', serif;
+  color: var(--color-accent);
+  font-size: 1.4em;
+  margin-bottom: 16px;
+}
+h3 {
+  color: var(--color-accent-light);
+  font-size: 1em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+code {
+  background: #e8ebe0;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.85em;
+  color: var(--color-accent);
+}
+pre {
+  background: #e8ebe0;
+  border-left: 4px solid var(--color-accent);
+  padding: 16px;
+  border-radius: 4px;
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--color-fg);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+th {
+  background: var(--color-accent);
+  color: white;
+  padding: 8px 12px;
+  text-align: left;
+}
+td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+tr:nth-child(even) td { background: #eceee6; }
+blockquote {
+  background: var(--color-note);
+  border-left: 4px solid var(--color-warn);
+  padding: 12px 16px;
+  margin: 16px 0;
+  border-radius: 0 4px 4px 0;
+  font-style: normal;
+  color: var(--color-fg);
+}
+.danger {
+  background: #f7e8e8;
+  border-left: 4px solid var(--color-danger);
+  padding: 12px 16px;
+  border-radius: 0 4px 4px 0;
+  margin: 12px 0;
+}
+ul { line-height: 1.8; }
+li { margin-bottom: 4px; }
+footer {
+  font-size: 0.7em;
+  color: var(--color-muted);
+}
+section.title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: left;
+}
+section.title h1 {
+  font-size: 2.6em;
+  border: none;
+}
+section.title p {
+  color: var(--color-muted);
+  font-size: 1em;
+  margin-top: 8px;
+}
+section.dense {
+  font-size: 13px;
+  padding: 32px 48px;
+}
+section.dense h1 {
+  font-size: 1.6em;
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+section.dense pre {
+  font-size: 0.7em;
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+section.dense table {
+  font-size: 0.8em;
+}
+section.dense th, section.dense td {
+  padding: 5px 10px;
+}
+section.dense ul {
+  line-height: 1.5;
+}
+section.dense li {
+  margin-bottom: 2px;
+}
+section.dense blockquote {
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 0.9em;
+}
+section.dense p {
+  margin: 6px 0;
+}
+;" data-marpit-pagination-total="23">
+<h1 id="thank-you">Thank You</h1>
+<p><strong>Thanh Nguyen</strong></p>
+<p><code>boku.thanhnguyen.dev</code></p>
 </section>
 <script>!function(){"use strict";const t={h1:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"1"},style:"display: block; font-size: 2em; margin-block-start: 0.67em; margin-block-end: 0.67em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},h2:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"2"},style:"display: block; font-size: 1.5em; margin-block-start: 0.83em; margin-block-end: 0.83em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},h3:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"3"},style:"display: block; font-size: 1.17em; margin-block-start: 1em; margin-block-end: 1em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},h4:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"4"},style:"display: block; margin-block-start: 1.33em; margin-block-end: 1.33em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},h5:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"5"},style:"display: block; font-size: 0.83em; margin-block-start: 1.67em; margin-block-end: 1.67em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},h6:{proto:()=>HTMLHeadingElement,attrs:{role:"heading","aria-level":"6"},style:"display: block; font-size: 0.67em; margin-block-start: 2.33em; margin-block-end: 2.33em; margin-inline-start: 0px; margin-inline-end: 0px; font-weight: bold;"},span:{proto:()=>HTMLSpanElement},pre:{proto:()=>HTMLElement,style:"display: block; font-family: monospace; white-space: pre; margin: 1em 0; --marp-auto-scaling-white-space: pre;"}},e="data-marp-auto-scaling-wrapper",i="data-marp-auto-scaling-svg",n="data-marp-auto-scaling-container";class s extends HTMLElement{container;containerSize;containerObserver;svg;svgComputedStyle;svgPreserveAspectRatio="xMinYMid meet";wrapper;wrapperSize;wrapperObserver;constructor(){super();const t=t=>([e])=>{const{width:i,height:n}=e.contentRect;this[t]={width:i,height:n},this.updateSVGRect()};this.attachShadow({mode:"open"}),this.containerObserver=new ResizeObserver(t("containerSize")),this.wrapperObserver=new ResizeObserver((...e)=>{t("wrapperSize")(...e),this.flushSvgDisplay()})}static get observedAttributes(){return["data-downscale-only"]}connectedCallback(){this.shadowRoot.innerHTML=`\n<style>\n  svg[${i}] { display: block; width: 100%; height: auto; vertical-align: top; }\n  span[${n}] { display: table; white-space: var(--marp-auto-scaling-white-space, nowrap); width: max-content; }\n</style>\n<div ${e}>\n  <svg part="svg" ${i}>\n    <foreignObject><span ${n}><slot></slot></span></foreignObject>\n  </svg>\n</div>\n    `.split(/\n\s*/).join(""),this.wrapper=this.shadowRoot.querySelector(`div[${e}]`)??void 0;const t=this.svg;this.svg=this.wrapper?.querySelector(`svg[${i}]`)??void 0,this.svg!==t&&(this.svgComputedStyle=this.svg?window.getComputedStyle(this.svg):void 0),this.container=this.svg?.querySelector(`span[${n}]`)??void 0,this.observe()}disconnectedCallback(){this.svg=void 0,this.svgComputedStyle=void 0,this.wrapper=void 0,this.container=void 0,this.observe()}attributeChangedCallback(){this.observe()}flushSvgDisplay(){const{svg:t}=this;t&&(t.style.display="inline",requestAnimationFrame(()=>{t.style.display=""}))}observe(){this.containerObserver.disconnect(),this.wrapperObserver.disconnect(),this.wrapper&&this.wrapperObserver.observe(this.wrapper),this.container&&this.containerObserver.observe(this.container),this.svgComputedStyle&&this.observeSVGStyle(this.svgComputedStyle)}observeSVGStyle(t){const e=()=>{const i=(()=>{const e=t.getPropertyValue("--preserve-aspect-ratio");if(e)return e.trim();return`x${(({textAlign:t,direction:e})=>{if(t.endsWith("left"))return"Min";if(t.endsWith("right"))return"Max";if("start"===t||"end"===t){let i="rtl"===e;return"end"===t&&(i=!i),i?"Max":"Min"}return"Mid"})(t)}YMid meet`})();i!==this.svgPreserveAspectRatio&&(this.svgPreserveAspectRatio=i,this.updateSVGRect()),t===this.svgComputedStyle&&requestAnimationFrame(e)};e()}updateSVGRect(){let t=Math.ceil(this.containerSize?.width??0);const e=Math.ceil(this.containerSize?.height??0);void 0!==this.dataset.downscaleOnly&&(t=Math.max(t,this.wrapperSize?.width??0));const i=this.svg?.querySelector(":scope > foreignObject");if(i?.setAttribute("width",`${t}`),i?.setAttribute("height",`${e}`),this.svg&&(this.svg.setAttribute("viewBox",`0 0 ${t} ${e}`),this.svg.setAttribute("preserveAspectRatio",this.svgPreserveAspectRatio),this.svg.style.height=t<=0||e<=0?"0":""),this.container){const t=this.svgPreserveAspectRatio.toLowerCase();this.container.style.marginLeft=t.startsWith("xmid")||t.startsWith("xmax")?"auto":"0",this.container.style.marginRight=t.startsWith("xmi")?"auto":"0"}}}const r=(t,{attrs:e={},style:i})=>class extends t{constructor(...t){super(...t);for(const[t,i]of Object.entries(e))this.hasAttribute(t)||this.setAttribute(t,i);this._shadow()}static get observedAttributes(){return["data-auto-scaling"]}connectedCallback(){this._update()}attributeChangedCallback(){this._update()}_shadow(){if(!this.shadowRoot)try{this.attachShadow({mode:"open"})}catch(t){if(!(t instanceof Error&&"NotSupportedError"===t.name))throw t}return this.shadowRoot}_update(){const t=this._shadow();if(t){const e=i?`<style>:host { ${i} }</style>`:"";let n="<slot></slot>";const{autoScaling:s}=this.dataset;if(void 0!==s){n=`<marp-auto-scaling exportparts="svg:auto-scaling" ${"downscale-only"===s?"data-downscale-only":""}>${n}</marp-auto-scaling>`}t.innerHTML=e+n}}};let o;const a=()=>o??(o=!!document.createElement("div",{is:"marp-auto-scaling"}).outerHTML.startsWith("<div is"),o),l=Symbol();let c;const d="marpitSVGPolyfill:setZoomFactor,",h=Symbol(),g=Symbol();const p=()=>{const t="Apple Computer, Inc."===navigator.vendor,e=t?[v]:[],i={then:e=>(t?(async()=>{if(void 0===c){const t=document.createElement("canvas");t.width=10,t.height=10;const e=t.getContext("2d"),i=new Image(10,10),n=new Promise(t=>{i.addEventListener("load",()=>t())});i.crossOrigin="anonymous",i.src="data:image/svg+xml;charset=utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2210%22%20height%3D%2210%22%20viewBox%3D%220%200%201%201%22%3E%3CforeignObject%20width%3D%221%22%20height%3D%221%22%20requiredExtensions%3D%22http%3A%2F%2Fwww.w3.org%2F1999%2Fxhtml%22%3E%3Cdiv%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F1999%2Fxhtml%22%20style%3D%22width%3A%201px%3B%20height%3A%201px%3B%20background%3A%20red%3B%20position%3A%20relative%22%3E%3C%2Fdiv%3E%3C%2FforeignObject%3E%3C%2Fsvg%3E",await n,e.drawImage(i,0,0),c=e.getImageData(5,5,1,1).data[3]<128}return c})().then(t=>{null==e||e(t?[v]:[])}):null==e||e([]),i)};return Object.assign(e,i)};let m,u;function v(t){const e="object"==typeof t&&t.target||document,i="object"==typeof t?t.zoom:t;window[g]||(Object.defineProperty(window,g,{configurable:!0,value:!0}),document.body.style.zoom=1.0001,document.body.offsetHeight,document.body.style.zoom=1,window.addEventListener("message",({data:t,origin:e})=>{if(e===window.origin)try{if(t&&"string"==typeof t&&t.startsWith(d)){const[,e]=t.split(","),i=Number.parseFloat(e);Number.isNaN(i)||(u=i)}}catch(t){console.error(t)}}));let n=!1;Array.from(e.querySelectorAll("svg[data-marpit-svg]"),t=>{var e,s,r,o;t.style.transform||(t.style.transform="translateZ(0)");const a=i||u||t.currentScale||1;m!==a&&(m=a,n=a);const l=t.getBoundingClientRect(),{length:c}=t.children;for(let i=0;i<c;i+=1){const n=t.children[i];if(n.getScreenCTM){const t=n.getScreenCTM();if(t){const i=null!==(s=null===(e=n.x)||void 0===e?void 0:e.baseVal.value)&&void 0!==s?s:0,c=null!==(o=null===(r=n.y)||void 0===r?void 0:r.baseVal.value)&&void 0!==o?o:0,d=n.children.length;for(let e=0;e<d;e+=1){const s=n.children[e];if("SECTION"===s.tagName){const{style:e}=s;e.transformOrigin||(e.transformOrigin=`${-i}px ${-c}px`),e.transform=`scale(${a}) matrix(${t.a}, ${t.b}, ${t.c}, ${t.d}, ${t.e-l.left}, ${t.f-l.top}) translateZ(0.0001px)`;break}}}}}}),!1!==n&&Array.from(e.querySelectorAll("iframe"),({contentWindow:t})=>{null==t||t.postMessage(`${d}${n}`,"null"===window.origin?"*":window.origin)})}function w({once:t=!1,target:e=document}={}){const i=function(t=document){if(t[h])return t[h];let e=!0;const i=()=>{e=!1,delete t[h]};Object.defineProperty(t,h,{configurable:!0,value:i});let n=[],s=!1;(async()=>{try{n=await p()}finally{s=!0}})();const r=()=>{for(const e of n)e({target:t});s&&0===n.length||e&&window.requestAnimationFrame(r)};return r(),i}(e);return t?(i(),()=>{}):i}m=1,u=void 0;const b=Symbol(),y=(e=document)=>{if("undefined"==typeof window)throw new Error("Marp Core's browser script is valid only in browser context.");if(((e=document)=>{const i=window[l];i||customElements.define("marp-auto-scaling",s);for(const n of Object.keys(t)){const s=`marp-${n}`,o=t[n].proto();a()&&o!==HTMLElement?i||customElements.define(s,r(o,{style:t[n].style}),{extends:n}):(i||customElements.define(s,r(HTMLElement,t[n])),e.querySelectorAll(`${n}[is="${s}"]`).forEach(t=>{t.outerHTML=t.outerHTML.replace(new RegExp(`^<${n}`,"i"),`<${s}`).replace(new RegExp(`</${n}>$`,"i"),`</${s}>`)}))}window[l]=!0})(e),e[b])return e[b];const i=w({target:e}),n=()=>{i(),delete e[b]},o=Object.assign(n,{cleanup:n,update:()=>y(e)});return Object.defineProperty(e,b,{configurable:!0,value:o}),o},f=document.currentScript;y(f?f.getRootNode():document)}();
 </script></foreignObject></svg></div><script>/*!! License: https://unpkg.com/@marp-team/marp-cli@4.5.0/lib/bespoke.js.LICENSE.txt */
